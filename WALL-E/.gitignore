@@ -1,0 +1,19 @@
+# ---- Secrets (NEVER commit real credentials) ----
+include/secrets.h
+secrets.h
+
+# ---- PlatformIO ----
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# ---- Build output ----
+build/
+*.bin
+*.elf
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
