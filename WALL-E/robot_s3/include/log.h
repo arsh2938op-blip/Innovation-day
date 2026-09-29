@@ -1,7 +1,7 @@
 // ============================================================
 //  Tiny logging helper -> produces the exact log format used in
 //  the spec, e.g.  [WIFI] Connecting...
-//  Usage: LOGI("WIFI", "Connected");   LOGE("STT", "HTTP %d", code);
+//  Usage: LOGI("WIFI", "Connected");   LOGE("S3", "HTTP %d", code);
 // ============================================================
 #pragma once
 

@@ -10,11 +10,12 @@
 
 // ---------------- expressions ----------------
 enum Expression {
+    // EXPR_LISTENING / EXPR_SPEAKING were removed with STT/TTS. The
+    // face set is shared with the companion app, so everything else
+    // is untouched.
     EXPR_BOOT,
     EXPR_IDLE,
-    EXPR_LISTENING,
     EXPR_THINKING,
-    EXPR_SPEAKING,
     EXPR_HAPPY,
     EXPR_CONFUSED,
     EXPR_SURPRISED,

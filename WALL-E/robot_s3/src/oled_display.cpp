@@ -9,9 +9,7 @@ const char* OledDisplay::nameOf(Expression e) {
     switch (e) {
         case EXPR_BOOT:       return "boot";
         case EXPR_IDLE:       return "idle";
-        case EXPR_LISTENING:  return "listening";
         case EXPR_THINKING:   return "thinking";
-        case EXPR_SPEAKING:   return "speaking";
         case EXPR_HAPPY:      return "happy";
         case EXPR_CONFUSED:   return "confused";
         case EXPR_SURPRISED:  return "surprised";
@@ -106,24 +104,6 @@ void OledDisplay::drawEyes(Expression e, int cx, int cy, bool blink) {
     const int ph = (_animPhaseMs / 120) % 4;  // 0..3 animation phase
 
     switch (e) {
-        case EXPR_LISTENING:
-            // tall wide eyes + bouncing pupil
-            _dpy->fillRoundRect(cx - dx - ew/2, cy - eh, ew, eh * 2, 4, SSD1306_WHITE);
-            _dpy->fillRoundRect(cx + dx - ew/2, cy - eh, ew, eh * 2, 4, SSD1306_WHITE);
-            _dpy->fillRect(cx - dx - 2, cy - 4 + ph * 2, 4, 4, SSD1306_BLACK);
-            _dpy->fillRect(cx + dx - 2, cy - 4 + ph * 2, 4, 4, SSD1306_BLACK);
-            break;
-
-        case EXPR_SPEAKING: {
-            // squash/stretch while "talking"
-            int h = (ph % 2) ? 10 : 16;
-            _dpy->drawRoundRect(cx - dx - ew/2, cy - h, ew, h * 2, 3, SSD1306_WHITE);
-            _dpy->drawRoundRect(cx + dx - ew/2, cy - h, ew, h * 2, 3, SSD1306_WHITE);
-            _dpy->fillRect(cx - dx - 2, cy - 3, 4, 5, SSD1306_WHITE);
-            _dpy->fillRect(cx + dx - 2, cy - 3, 4, 5, SSD1306_WHITE);
-            break;
-        }
-
         case EXPR_THINKING:
             // half closed + one raised
             _dpy->drawLine(cx - dx - 7, cy, cx - dx + 7, cy, SSD1306_WHITE);
@@ -228,11 +208,6 @@ void OledDisplay::drawMouth(Expression e, int cx, int cy) {
                 _dpy->drawPixel(cx + i, d, SSD1306_WHITE);
             }
             break;
-        case EXPR_SPEAKING: {
-            int h = ((_animPhaseMs / 90) % 3) * 3 + 2;
-            _dpy->drawRoundRect(cx - 9, y - 1, 18, h + 2, 2, SSD1306_WHITE);
-            break;
-        }
         case EXPR_ANGRY:
         case EXPR_SURPRISED:
             _dpy->drawCircle(cx, y + 4, 6, SSD1306_WHITE);
@@ -245,9 +220,6 @@ void OledDisplay::drawMouth(Expression e, int cx, int cy) {
         case EXPR_ERROR:
         case EXPR_OFFLINE:
             _dpy->drawLine(cx - 8, y + 4, cx + 8, y + 4, SSD1306_WHITE);
-            break;
-        case EXPR_LISTENING:
-            _dpy->drawRoundRect(cx - 7, y, 14, 8, 3, SSD1306_WHITE);
             break;
         case EXPR_BOOT:
         case EXPR_SLEEPING:

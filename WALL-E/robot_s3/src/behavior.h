@@ -3,13 +3,19 @@
 //  ------------------------------------------------------------
 //  Owns the robot state machine and decides what WALL-E does:
 //    * explore its surroundings
-//    * listen -> transcribe -> ask Gemini -> speak
+//    * answer a question with Gemini (text only - see below)
 //    * tell a joke when nobody is talking to it
 //    * dance
 //
-//  All timing is non-blocking. The three network calls (STT, Gemini,
-//  TTS) are synchronous but time-bounded (see config.h) and each one
-//  runs as a single step of the conversation script, so the state
+//  VOICE NOTE: STT and TTS were removed from this firmware, so
+//  there is no microphone capture and no speech synthesis any
+//  more. WALL-E's Gemini personality is untouched - a reply is
+//  now shown on the OLED caption and forwarded to the companion
+//  app instead of being spoken.
+//
+//  All timing is non-blocking. The one network call (Gemini) is
+//  synchronous but time-bounded (see GEMINI_TIMEOUT_MS) and runs
+//  as a single step of the conversation script, so the state
 //  machine never gets stuck.
 // ============================================================
 #pragma once
@@ -47,23 +53,32 @@ public:
     // Call once per loop() iteration.
     void update(uint32_t now);
 
-    // ---- external triggers (serial console, test mode) ----
-    void requestTalk();
-    void requestDance();
+    // ---- external triggers (serial console, remote, test mode) ----
+    void requestChat(const String& prompt);   // ask Gemini about `prompt`
     void requestJoke();
+    void requestDance();
     void requestExplore();
+    void requestIdle();
     void halt();                      // stop everything immediately
+
+    // ---- autonomous mode ----
+    // While autonomy is on, IDLE schedules jokes / dance / explore
+    // on its own. Turning it off parks the robot in plain IDLE.
+    // Driven by the remote's autonomous_on / autonomous_off.
+    void setAutonomous(bool on) { _autonomous = on; if (!on) requestIdle(); }
+    bool autonomous() const { return _autonomous; }
+
+    // ---- external (remote / app) manual drive ----
+    // The remote drives the motors directly through the dispatcher
+    // rather than through the state machine, so it needs a way to
+    // suspend autonomy without cancelling an in-flight joke.
+    void suspendAutonomy(uint32_t now);
 
 private:
     // steps of the "someone talked to me" script
     enum ConvStep {
         CONV_IDLE_STEP,
-        CONV_RECORD_START,
-        CONV_RECORDING,
-        CONV_STT_REQUEST,
         CONV_GEMINI_REQUEST,
-        CONV_TTS_REQUEST,
-        CONV_PLAYING,
         CONV_DONE
     };
 
@@ -72,10 +87,9 @@ private:
 
     // conversation
     ConvStep _conv = CONV_IDLE_STEP;
-    uint8_t  _ttsChunk = 0, _ttsChunkMax = 0;
-    String   _transcript, _reply;
-    String   _chunks[4];
+    String   _prompt, _reply;
     bool     _jokeMode = false;
+    bool     _autonomous = WALLE_AUTONOMOUS_DEFAULT;
 
     // exploration
     uint32_t _exploreNextMs = 0;

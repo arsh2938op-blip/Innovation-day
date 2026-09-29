@@ -23,8 +23,6 @@
 #define WALLE_WIFI_SSID      ""
 #define WALLE_WIFI_PASSWORD  ""
 #define WALLE_GEMINI_API_KEY ""
-#define WALLE_STT_API_KEY    ""
-#define WALLE_TTS_API_KEY    ""
 #endif
 
 // ------------------------------------------------------------
@@ -36,12 +34,20 @@
 
 #define WALLE_ENABLE_MOTORS     1
 #define WALLE_ENABLE_OLED       1
-#define WALLE_ENABLE_AUDIO_IN   1   // microphone (I2S)
-#define WALLE_ENABLE_AUDIO_OUT  1   // speaker via amplifier (I2S)
 #define WALLE_ENABLE_WIFI       1
 
+// Wireless remote link (ESP-NOW peer: the ESP32-WROOM handheld).
+// STT/TTS were removed from this firmware, so voice input is gone;
+// the remote is now the way you drive WALL-E by hand.
+#define WALLE_ENABLE_REMOTE     1
+
+// Autonomous behaviour (idle -> joke / dance / explore on its own).
+// This is the default state at boot; the remote's
+// autonomous_on / autonomous_off commands flip it at runtime.
+#define WALLE_AUTONOMOUS_DEFAULT 1
+
 // The camera is DISABLED by default.
-// Most ESP32-C3 boards have no camera peripheral; the camera modules that
+// A plain ESP32-S3 module has no camera peripheral either; the camera modules that
 // do exist need a specific SoC (e.g. ESP32-P4) and a vendor camera driver.
 // Set to 1 only after you have confirmed your board actually has one and you
 // have wired the camera pins in section 5 below.
@@ -53,17 +59,25 @@
 #define TODO_CONFIGURE_GPIO  (-1)
 #define PIN_IS_UNSET(p)      ((p) < 0)
 
-// ============================================================
-//  HARDWARE PINS
+// ------------------------------------------------------------
+//  HARDWARE PINS  (ESP32-S3)
 //  >>> FILL THESE IN FOR YOUR BOARD. <<<
-//  Rule of thumb: never use the strapping pins GPIO 2, 8 and 9
-//  for anything that pulls at boot time (motor drivers, I2C pull-ups).
-//  Also avoid the flash pins GPIO 11-17 on most C3 modules.
+//  The S3 devkit exposes far more usable GPIO than the C3 did, and
+//  the I2S microphone + speaker pins are now free because STT/TTS
+//  were removed, so there is plenty of room for the motors, the
+//  OLED and the ESP-NOW radio.
+//
+//  Avoid on the S3:
+//    * GPIO 26..32  - wired to the SPI flash / PSRAM on most modules
+//    * GPIO 45 & 46 - strapping pins (VDD_SPI voltage select)
+//    * GPIO 0, 3    - strapping pins (boot mode), and GPIO 0 drives
+//                     the on-board LED
+//    * GPIO 19, 20  - USB D-/D+ (only free if you do not use USB)
 // ============================================================
 
 // ------------------------------------------------------------
 // 3. OLED - SSD1306 128x64, I2C
-//    Default I2C bus on C3: SDA=GPIO8 / SCL=GPIO9  (many devkits)
+//    Any free S3 GPIO pair works; the I2C bus is fully software.
 // ------------------------------------------------------------
 #define OLED_I2C_PORT     0
 #define OLED_I2C_SDA_PIN  TODO_CONFIGURE_GPIO
@@ -127,44 +141,65 @@ static const int8_t MOTOR_R2_IN2 = TODO_CONFIGURE_GPIO;
 #define CAMERA_JPEG_QUALITY   12
 
 // ------------------------------------------------------------
-// 6. Microphone - I2S in (digital mic: INMP441 / ICS-43434 / MSM261)
-//    -> STT needs 16 kHz / 16-bit / mono PCM.
+// 6. Microphone / speaker  -- REMOVED
 // ------------------------------------------------------------
-#define MIC_I2S_PORT          0
-#define MIC_I2S_BCLK_PIN      TODO_CONFIGURE_GPIO
-#define MIC_I2S_WS_PIN        TODO_CONFIGURE_GPIO
-#define MIC_I2S_DIN_PIN       TODO_CONFIGURE_GPIO
-#define MIC_I2S_DATA_BITS     32   // most mems output 24 bit data in a 32 bit slot
-
-// Audio sample format shared by mic and speaker (must match the STT/TTS API)
-#define AUDIO_SAMPLE_RATE     16000
-#define AUDIO_SAMPLE_BITS     16
-#define AUDIO_CHANNELS        1
-// Longest clip we are willing to hold in RAM.
+//  STT and TTS were removed from this firmware, so there is no I2S
+//  audio capture and no I2S audio playback any more. The I2S pins
+//  (and the RAM the PCM buffers used) are free for the motors,
+//  the OLED and the remote link. See git history for the previous
+//  MIC_I2S_* / SPK_I2S_* / AUDIO_* settings.
 //
-// Peak heap use for one STT request at 2 s:
-//   64 kB raw PCM  +  85 kB base64  +  85 kB JSON body  ~= 234 kB
-// which fits the ~290 kB of free heap on a C3. Raising this much above 2 s
-// will fail the malloc in SttClient and log an out-of-memory error.
-#define AUDIO_MAX_RECORD_MS   2000
+//  WALL-E still talks, it just shows the answer on its face and in
+//  the companion app instead of speaking it out loud.
 
 // ------------------------------------------------------------
-// 7. Speaker / amplifier - I2S out (MAX98357A is a common choice)
-// ------------------------------------------------------------
-#define SPK_I2S_PORT          1
-#define SPK_I2S_BCLK_PIN      TODO_CONFIGURE_GPIO
-#define SPK_I2S_LRCK_PIN      TODO_CONFIGURE_GPIO
-#define SPK_I2S_DOUT_PIN      TODO_CONFIGURE_GPIO
-#define SPK_I2S_DATA_BITS     16
-#define SPK_VOLUME            7   // 0..10  (software gain, clamped)
-
-// ------------------------------------------------------------
-// 8. Wi-Fi
+// 7. Wi-Fi
 // ------------------------------------------------------------
 #define WIFI_CONNECT_TIMEOUT_MS   20000
 #define WIFI_RETRY_INTERVAL_MS   10000
 #define WIFI_OFFLINE_CHECK_MS     5000
 #define WIFI_DHCP_TIMEOUT_MS     10000
+
+// ============================================================
+//  8. WIRELESS REMOTE LINK (ESP-NOW, ESP32-WROOM remote)
+// ============================================================
+//  Why ESP-NOW: it is ESP32-to-ESP32 at the Wi-Fi MAC layer, needs
+//  no router, no access point, no pairing and no internet, and a
+//  10-byte command packet costs about as much airtime as a BLE
+//  advertisement. Latency is ~1 ms on an open channel.
+//
+//  IMPORTANT - CHANNEL: ESP-NOW and the Wi-Fi station connection
+//  share one radio. While the robot is joined to the app's
+//  network it sits on the router's channel, and the remote must
+//  therefore use the SAME channel (see remote_wroom's
+//  REMOTE_CHANNEL). If the robot is not connected to Wi-Fi it
+//  falls back to WALLE_REMOTE_FALLBACK_CHANNEL. Bumping either
+//  number to match your router is the only setup the remote needs.
+
+// 0 = follow the Wi-Fi channel the robot is associated with.
+// Any other value pins the radio to that channel, which is what
+// you want if the robot spends most of its time offline.
+#define WALLE_REMOTE_PIN_CHANNEL      0
+#define WALLE_REMOTE_FALLBACK_CHANNEL 6
+
+// Hard safety timer. If no valid packet from the remote arrives
+// within this window while the remote is driving, the robot stops.
+// Held buttons re-send every REMOTE_REPEAT_MS (WROOM side), which
+// is far below this value, so a healthy link never trips it.
+#define REMOTE_TIMEOUT_MS            400
+
+// How long the remote keeps priority over other command sources
+// after it last sent a movement command (see command_dispatch).
+#define REMOTE_CONTROL_HOLD_MS       600
+
+// Seconds between status pushes to the remote. The robot only
+// sends status on events (ack, state change, error, ping reply),
+// so this is purely the keepalive floor.
+#define REMOTE_STATUS_INTERVAL_MS   1000
+
+// Log every received packet. Leave at 0; the ack/timeout logging
+// is already enough to debug a link.
+#define REMOTE_VERBOSE_LOG            0
 
 // ============================================================
 //  9. NETWORK SERVICES
@@ -183,21 +218,12 @@ static const int8_t MOTOR_R2_IN2 = TODO_CONFIGURE_GPIO;
   "You are funny, curious and speak in 1-3 very SHORT sentences. " \
   "Never use lists, markdown or emoji. Talk like a grumpy little movie robot."
 
-// ---- Speech-to-Text (Google Cloud STT v1, synchronous) ----
-#define STT_ENABLED            1
-#define STT_HOST               "speech.googleapis.com"
-#define STT_PATH               "/v1/speech:recognize"
-#define STT_TIMEOUT_MS         20000
-#define STT_LANGUAGE_CODE      "en-US"
-
-// ---- Text-to-Speech (Google Cloud TTS v1, LINEAR16 -> no decoder needed) ----
-#define TTS_ENABLED            1
-#define TTS_HOST               "tts.googleapis.com"
-#define TTS_PATH               "/v1/text:synthesize"
-#define TTS_TIMEOUT_MS         20000
-#define TTS_VOICE_LANGUAGE     "en-US"
-#define TTS_VOICE_NAME         "en-US-Standard-C"   // en-US-Neural2-* if you have access
-#define TTS_MAX_CHARS          180                 // keep requests small, chunk in code
+// ---- STT / TTS: REMOVED ----
+//  Speech-to-Text and Text-to-Speech are gone from the robot
+//  firmware, together with their hosts, paths, timeouts and
+//  voice settings. Gemini above is untouched and is still used
+//  for WALL-E's personality (jokes, idle chatter, "say ..." from
+//  the serial console and the companion app).
 
 // ============================================================
 //  10. MOTION / SPEED
@@ -224,9 +250,8 @@ static const int8_t MOTOR_R2_IN2 = TODO_CONFIGURE_GPIO;
 #define JOKE_CHANCE_PCT             30     // when self-initiating, tell a joke instead
 #define DANCE_CHANCE_PCT            25
 
-// Reaction time to a recognised keyword (simple VAD wake word)
-#define VAD_THRESHOLD_DB            -45    // dBFS threshold
-#define VAD_SILENCE_MS              900    // stop recording after this much silence
+// (the VAD wake-word thresholds that used to live here were part of
+//  the microphone/STT path and were removed with it)
 
 // ============================================================
 //  12. DANCE TIMING
@@ -239,7 +264,7 @@ static const int8_t MOTOR_R2_IN2 = TODO_CONFIGURE_GPIO;
 // ============================================================
 //  13. OLED
 // ============================================================
-#define OLED_FRAME_MS           60     // ~16 fps, easy on the C3
+#define OLED_FRAME_MS           60     // ~16 fps, easy on the S3
 #define OLED_BLINK_INTERVAL_MS  2600
 #define OLED_SPLASH_MS          2000
 

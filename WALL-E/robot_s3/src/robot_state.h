@@ -6,16 +6,18 @@
 #include <Arduino.h>
 #include "config.h"
 
+// STATE_LISTENING and STATE_SPEAKING were removed with STT/TTS: they
+// only existed to bracket the microphone and the speaker. STATE_THINKING
+// stays - it is where Gemini runs.
 enum RobotState {
     STATE_BOOT,
     STATE_IDLE,
-    STATE_LISTENING,
     STATE_THINKING,
-    STATE_SPEAKING,
     STATE_EXPLORING,
     STATE_OBSERVING,
     STATE_MOVING,
     STATE_DANCING,
+    STATE_REMOTE_MANUAL,   // wheels owned by the wireless remote
     STATE_OFFLINE,
     STATE_COUNT
 };

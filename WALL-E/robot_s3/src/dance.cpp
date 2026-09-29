@@ -14,7 +14,7 @@ static const Dance::Step kRoutine[] = {
     //  l1    l2    r1    r2   dur    face
     {  90,   90,  -90,  -90,  DANCE_STEP_MS, EXPR_DANCING },  // lean / spin left
     { -90,  -90,   90,   90,  DANCE_STEP_MS, EXPR_DANCING },  // spin right
-    { 150,  150,  150,  150,  DANCE_STEP_MS, EXPR_SPEAKING  },  // forward
+    { 150,  150,  150,  150,  DANCE_STEP_MS, EXPR_HAPPY     },  // forward
     {   0,    0,    0,    0,  DANCE_PAUSE_MS, EXPR_HAPPY     },  // freeze + happy face
     { -120, -120,  120,  120,  DANCE_STEP_MS, EXPR_DANCING },  // turn
     {  120,  120, -120, -120,  DANCE_STEP_MS, EXPR_DANCING },  // turn back

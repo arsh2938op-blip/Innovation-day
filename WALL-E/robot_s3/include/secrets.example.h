@@ -16,11 +16,8 @@
 // Get a key at: https://aistudio.google.com/app/apikey
 #define WALLE_GEMINI_API_KEY "PASTE_GEMINI_API_KEY_HERE"
 
-// ---------------- Speech-to-Text (Google Cloud STT v1) ----------------
-// Optional: enabled/disabled + endpoint can be changed in include/config.h
-#define WALLE_STT_API_KEY   "PASTE_GOOGLE_CLOUD_STT_KEY_HERE"
-
-// ---------------- Text-to-Speech ----------------
-// Google Cloud TTS uses the same Google Cloud key as STT.
-// If you switch TTS to a different provider, put that key here instead.
-#define WALLE_TTS_API_KEY   "PASTE_GOOGLE_CLOUD_TTS_KEY_HERE"
+// ---------------- Speech ----------------
+// The STT and TTS keys that used to live here were removed with the
+// voice pipeline. WALL-E no longer listens or speaks: it shows its
+// Gemini replies on the OLED and in the companion app. The Gemini
+// key above is now the only API key the robot needs.

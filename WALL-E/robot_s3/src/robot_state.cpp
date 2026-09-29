@@ -11,13 +11,14 @@ RobotStateMachine* gRobotSM = nullptr;
 // Prevents the state machine from flickering between two states.
 uint32_t RobotStateMachine::minDwell(RobotState s) {
     switch (s) {
-        case STATE_LISTENING: return 300;
         case STATE_THINKING:  return 200;
         case STATE_EXPLORING: return 500;
         case STATE_OBSERVING: return 300;
         case STATE_MOVING:    return 250;
         case STATE_DANCING:   return 500;
-        case STATE_SPEAKING:  return 200;
+        // A held remote button re-sends continuously, so a long dwell
+        // here would only add lag to the next button press.
+        case STATE_REMOTE_MANUAL: return 0;
         default:              return 0;
     }
 }
@@ -26,9 +27,8 @@ const char* RobotStateMachine::nameOf(RobotState s) {
     switch (s) {
         case STATE_BOOT:      return "BOOT";
         case STATE_IDLE:      return "IDLE";
-        case STATE_LISTENING: return "LISTENING";
         case STATE_THINKING:  return "THINKING";
-        case STATE_SPEAKING:  return "SPEAKING";
+        case STATE_REMOTE_MANUAL: return "REMOTE";
         case STATE_EXPLORING: return "EXPLORING";
         case STATE_OBSERVING: return "OBSERVING";
         case STATE_MOVING:    return "MOVING";
@@ -77,12 +77,15 @@ void RobotStateMachine::enter(RobotState s, uint32_t now) {
     LOGI(TAG, "%s", nameOf(s));
 
     // Safety: any state that does not explicitly drive the motors
-    // must not leave them running.
+    // must not leave them running. STATE_REMOTE_MANUAL is the one
+    // exception - remote_link.cpp owns the motors there and stops
+    // them itself on release, timeout or link loss.
     switch (s) {
         case STATE_MOVING:
         case STATE_DANCING:
         case STATE_EXPLORING:
-            break;                       // motion is owned by behaviour/dance
+        case STATE_REMOTE_MANUAL:
+            break;                       // motion is owned elsewhere
         default:
             motors.stop();
             break;
@@ -91,13 +94,12 @@ void RobotStateMachine::enter(RobotState s, uint32_t now) {
     switch (s) {
         case STATE_BOOT:      oled.setExpression(EXPR_BOOT);      break;
         case STATE_IDLE:      oled.setExpression(EXPR_IDLE);      break;
-        case STATE_LISTENING: oled.setExpression(EXPR_LISTENING); break;
         case STATE_THINKING:  oled.setExpression(EXPR_THINKING);  break;
-        case STATE_SPEAKING:  oled.setExpression(EXPR_SPEAKING);  break;
         case STATE_EXPLORING: oled.setExpression(EXPR_EXPLORING); break;
         case STATE_OBSERVING: oled.setExpression(EXPR_EXPLORING); break;
         case STATE_MOVING:    oled.setExpression(EXPR_HAPPY);     break;
         case STATE_DANCING:   oled.setExpression(EXPR_DANCING);   break;
+        case STATE_REMOTE_MANUAL: oled.setExpression(EXPR_HAPPY); break;
         case STATE_OFFLINE:   oled.setExpression(EXPR_OFFLINE);   break;
         default: break;
     }
