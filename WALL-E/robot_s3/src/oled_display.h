@@ -10,12 +10,13 @@
 
 // ---------------- expressions ----------------
 enum Expression {
-    // EXPR_LISTENING / EXPR_SPEAKING were removed with STT/TTS. The
-    // face set is shared with the companion app, so everything else
-    // is untouched.
+    // EXPR_LISTENING was removed with STT: the robot has no microphone.
+    // EXPR_SPEAKING is BACK, because TTS is back. The companion app
+    // already knows the "speaking" face by name.
     EXPR_BOOT,
     EXPR_IDLE,
     EXPR_THINKING,
+    EXPR_SPEAKING,
     EXPR_HAPPY,
     EXPR_CONFUSED,
     EXPR_SURPRISED,

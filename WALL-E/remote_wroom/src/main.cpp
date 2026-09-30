@@ -109,7 +109,24 @@ void loop() {
         remoteLink.sendCommand(WALLE_CMD_EXPR_SURPRISED, false);
     }
 
-    // ---- movement: send on the press edge ----
+    // ---- "say something out loud" ----
+// A tap asks the ROBOT to think of a line and speak it through its own
+// speaker. The remote never carries the Gemini key or any audio.
+if (remoteInput.justPressed(RBTN_TALK)) {
+    remoteLink.sendCommand(WALLE_CMD_TALK, false);
+    Serial.println("[WROOM] Asked the robot to speak");
+}
+
+// ---- "turn around" ----
+// A tap, not a hold: the robot times the 180 degree pivot itself and
+// stops on its own, so there is no key-repeat and no lost STOP.
+// The robot's cliff sensor still has veto power over the whole turn.
+if (remoteInput.justPressed(RBTN_TURN)) {
+    remoteLink.sendCommand(WALLE_CMD_TURN_AROUND, false);
+    Serial.println("[WROOM] Asked the robot to turn around");
+}
+
+// ---- movement: send on the press edge ----
     const uint8_t direction = remoteInput.heldDirection();
 
     if (direction != WALLE_CMD_NONE) {

@@ -13,6 +13,7 @@ enum RobotState {
     STATE_BOOT,
     STATE_IDLE,
     STATE_THINKING,
+    STATE_SPEAKING,        // Gemini TTS audio is playing out of the speaker
     STATE_EXPLORING,
     STATE_OBSERVING,
     STATE_MOVING,

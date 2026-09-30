@@ -10,6 +10,7 @@ const char* OledDisplay::nameOf(Expression e) {
         case EXPR_BOOT:       return "boot";
         case EXPR_IDLE:       return "idle";
         case EXPR_THINKING:   return "thinking";
+        case EXPR_SPEAKING:   return "speaking";
         case EXPR_HAPPY:      return "happy";
         case EXPR_CONFUSED:   return "confused";
         case EXPR_SURPRISED:  return "surprised";
@@ -110,6 +111,16 @@ void OledDisplay::drawEyes(Expression e, int cx, int cy, bool blink) {
             _dpy->drawRoundRect(cx + dx - 6, cy - 14, 12, 28, 4, SSD1306_WHITE);
             _dpy->fillRect(cx + dx - 2, cy - 4 + ph * 3, 4, 4, SSD1306_BLACK);
             break;
+
+        case EXPR_SPEAKING: {
+            // eyes squash and stretch in time with the speech
+            int h = (ph % 2) ? 10 : 16;
+            _dpy->drawRoundRect(cx - dx - ew/2, cy - h, ew, h * 2, 3, SSD1306_WHITE);
+            _dpy->drawRoundRect(cx + dx - ew/2, cy - h, ew, h * 2, 3, SSD1306_WHITE);
+            _dpy->fillRect(cx - dx - 2, cy - 3, 4, 5, SSD1306_WHITE);
+            _dpy->fillRect(cx + dx - 2, cy - 3, 4, 5, SSD1306_WHITE);
+            break;
+        }
 
         case EXPR_HAPPY:
             // upward arcs (^ ^)
@@ -212,6 +223,12 @@ void OledDisplay::drawMouth(Expression e, int cx, int cy) {
         case EXPR_SURPRISED:
             _dpy->drawCircle(cx, y + 4, 6, SSD1306_WHITE);
             break;
+        case EXPR_SPEAKING: {
+            // open/close in time with the audio
+            int h = ((_animPhaseMs / 90) % 3) * 3 + 2;
+            _dpy->drawRoundRect(cx - 9, y - 1, 18, h + 2, 2, SSD1306_WHITE);
+            break;
+        }
         case EXPR_THINKING:
         case EXPR_CONFUSED:
             _dpy->drawLine(cx - 8, y + 2, cx + 8, y + 2, SSD1306_WHITE);

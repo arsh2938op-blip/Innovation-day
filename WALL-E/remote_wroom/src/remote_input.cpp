@@ -19,6 +19,8 @@ void RemoteInput::begin() {
     _buttons[RBTN_MODE].attach(BTN_MODE_PIN);
     _buttons[RBTN_EXPR].attach(BTN_EXPR_PIN);
     _buttons[RBTN_SURPRISE].attach(BTN_SURPRISE_PIN);
+    _buttons[RBTN_TALK].attach(BTN_TALK_SEND_PIN);
+    _buttons[RBTN_TURN].attach(BTN_TURN_PIN);
 }
 
 void Button::attach(int8_t pin) {
@@ -77,6 +79,8 @@ uint8_t RemoteInput::commandFor(RemoteButtonId id) {
         case RBTN_DANCE:   return WALLE_CMD_DANCE;
         case RBTN_EXPR:    return WALLE_CMD_EXPR_HAPPY;
         case RBTN_SURPRISE:return WALLE_CMD_EXPR_SURPRISED;
+        case RBTN_TALK:    return WALLE_CMD_TALK;
+        case RBTN_TURN:    return WALLE_CMD_TURN_AROUND;
         default:           return WALLE_CMD_NONE;   // MODE is a toggle
     }
 }

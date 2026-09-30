@@ -1,5 +1,25 @@
 // ============================================================
-//  Motor controller - 4x DC motors through a PWM+direction driver
+//  Motor controller - 4x DC motors through a motor DRIVER MODULE
+//  ------------------------------------------------------------
+//  The ESP32-S3 never touches motor current. Every pin below goes to
+//  an H-bridge driver INPUT (2 x TB6612FNG is the reference design:
+//  4 channels, one per wheel). See config.h section 4 for why four
+//  independent channels are required and which drivers do not work.
+//
+//  Per wheel the driver takes:
+//     1x PWM   - speed        (LEDC channel, MOTOR_PWM_FREQ)
+//     2x DIR   - direction    (IN1 / IN2, "coast" = both LOW)
+//  plus a shared enable/standby pin per driver board.
+//
+//  Motor index order, used everywhere in this firmware:
+//     0 front-left   1 back-left   2 front-right   3 back-right
+//
+//  The side sign (_side) exists because the left and right wheels are
+//  mirrored on the chassis: to drive FORWARD the left wheels and the
+//  right wheels have to be driven in opposite electrical directions.
+//  Getting this wrong is the single most common reason a 4-wheel
+//  robot spins on the spot instead of moving, so test it with
+//  MotorController::setMotor() on one wheel at a time.
 // ============================================================
 #pragma once
 
@@ -26,24 +46,27 @@ public:
     // ---- safety ----
     bool motorsConfigured() const { return _configured; }
     void emergencyStop();                          // non-ramping, used on errors
-    void setDriverEnabled(bool on);                // toggles the driver STBY/EN pin
+    void setDriverEnabled(bool on);                // toggles every STBY/EN pin
+    bool driverEnabled() const { return _driverEnabled; }
     void update();                                 // call from loop() to advance the ramp
+
+    // ---- driver module identity (logs + test menu) ----
+    const char* driverName() const { return MOTOR_DRIVER_NAME; }
+    uint8_t channels() const { return _channels; }
 
 private:
     void applyAll(int16_t l1, int16_t l2, int16_t r1, int16_t r2);
+    void buildPinTable();
 
     struct Pins { int8_t pwm, in1, in2; };
-    Pins _pins[MOTOR_COUNT] = {
-        {MOTOR_L1_PIN, MOTOR_L1_IN1, MOTOR_L1_IN2},   // 0 front-left
-        {MOTOR_L2_PIN, MOTOR_L2_IN1, MOTOR_L2_IN2},   // 1 back-left
-        {MOTOR_R1_PIN, MOTOR_R1_IN1, MOTOR_R1_IN2},   // 2 front-right
-        {MOTOR_R2_PIN, MOTOR_R2_IN1, MOTOR_R2_IN2},   // 3 back-right
-    };
-    // left motors are 0,1   ->  sign flip for correct "forward" on mirrored chassis
-    static const int8_t _side[MOTOR_COUNT];   // +1 right, -1 left
+    Pins _pins[4] = {};
+    uint8_t _channels = 0;
 
-    int16_t _target[MOTOR_COUNT] = {0, 0, 0, 0};
-    int16_t _current[MOTOR_COUNT] = {0, 0, 0, 0};
+    // left motors are 0,1   ->  sign flip for correct "forward" on mirrored chassis
+    static const int8_t _side[4];   // +1 right, -1 left
+
+    int16_t _target[4] = {0, 0, 0, 0};
+    int16_t _current[4] = {0, 0, 0, 0};
     uint32_t _lastRampMs = 0;
     bool _configured = false;
     bool _driverEnabled = false;

@@ -12,6 +12,9 @@ RobotStateMachine* gRobotSM = nullptr;
 uint32_t RobotStateMachine::minDwell(RobotState s) {
     switch (s) {
         case STATE_THINKING:  return 200;
+        // Speaking is long and blocking; never interrupt it mid-word
+        // with a short dwell.
+        case STATE_SPEAKING:  return 2000;
         case STATE_EXPLORING: return 500;
         case STATE_OBSERVING: return 300;
         case STATE_MOVING:    return 250;
@@ -28,6 +31,7 @@ const char* RobotStateMachine::nameOf(RobotState s) {
         case STATE_BOOT:      return "BOOT";
         case STATE_IDLE:      return "IDLE";
         case STATE_THINKING:  return "THINKING";
+        case STATE_SPEAKING:  return "SPEAKING";
         case STATE_REMOTE_MANUAL: return "REMOTE";
         case STATE_EXPLORING: return "EXPLORING";
         case STATE_OBSERVING: return "OBSERVING";
@@ -95,6 +99,7 @@ void RobotStateMachine::enter(RobotState s, uint32_t now) {
         case STATE_BOOT:      oled.setExpression(EXPR_BOOT);      break;
         case STATE_IDLE:      oled.setExpression(EXPR_IDLE);      break;
         case STATE_THINKING:  oled.setExpression(EXPR_THINKING);  break;
+        case STATE_SPEAKING:  oled.setExpression(EXPR_SPEAKING);  break;
         case STATE_EXPLORING: oled.setExpression(EXPR_EXPLORING); break;
         case STATE_OBSERVING: oled.setExpression(EXPR_EXPLORING); break;
         case STATE_MOVING:    oled.setExpression(EXPR_HAPPY);     break;

@@ -28,6 +28,7 @@
 enum WalleMsgType : uint8_t {
     WALLE_MSG_COMMAND = 0x01,   // controller -> robot
     WALLE_MSG_STATUS  = 0x02,   // robot -> controller
+    WALLE_MSG_TEXT    = 0x03,   // variable length, see WALLE_PROTO_TEXT_HEADER
 };
 
 // ------------------------------------------------------------
@@ -60,6 +61,41 @@ enum WalleCommand : uint8_t {
     WALLE_CMD_AUTONOMOUS_ON = 0x13,
     WALLE_CMD_AUTONOMOUS_OFF= 0x14,
 
+    // ---- voice ----
+    // The robot owns the speaker and the Gemini TTS key; a controller
+    // only ever asks for an ACTION, never for audio.
+    //   TALK = "think of something to say, then say it out loud"
+    //   JOKE = "tell me a joke, out loud"
+    // Both are single fixed-size commands, so no new wire format and
+    // no variable-length frame is introduced.
+    //
+    // Speech-to-Text deliberately stays on the controller/app side:
+    // the robot has no microphone.
+    WALLE_CMD_TALK          = 0x15,
+    WALLE_CMD_JOKE          = 0x16,
+
+    // ---- measured motion (OPEN LOOP - there are no wheel encoders) ----
+    // "move some steps" and "turn around" as a controller would ask
+    // for them. The robot converts a distance into a duration using
+    // its own geometry (WHEEL_CIRCUMFERENCE_CM / STEP_DISTANCE_CM /
+    // TURN_360_MS in include/config.h) and then times it, so the
+    // distance is an ESTIMATE, not a measurement.
+    WALLE_CMD_MOVE_STEPS    = 0x17,   // arg = step count, 1..WALLE_MAX_STEPS
+    WALLE_CMD_TURN_AROUND   = 0x18,   // 180 degrees on the spot
+    WALLE_CMD_TURN_DEGREES  = 0x1C,   // arg = degrees, 1..360
+
+    // ---- sensors ----
+    // The cliff sensor is sampled continuously on the robot; this is
+    // only "tell me what you see right now".
+    WALLE_CMD_READ_SENSOR   = 0x19,   // answered with WALLE_ST_SENSOR
+
+    // ---- ask / speak with your own words ----
+    // Only meaningful over a stream transport (the app link). Sends a
+    // WALLE_MSG_TEXT frame right after this command; the robot answers
+    // with Gemini and then speaks. See WALLE_PROTO_TEXT_HEADER.
+    WALLE_CMD_ASK           = 0x1A,   // text = the question / prompt
+    WALLE_CMD_SPEAK         = 0x1B,   // text = say exactly this, no Gemini
+
     // ---- expressions ----
     WALLE_CMD_EXPR_HAPPY     = 0x20,
     WALLE_CMD_EXPR_THINKING  = 0x21,
@@ -78,8 +114,17 @@ enum WalleCommand : uint8_t {
 // Is this a command that drives the wheels? These are the ones
 // that put the robot into REMOTE_MANUAL and that the timeout
 // watchdog is allowed to stop.
+//
+// MOVE_STEPS and the turns are included even though they are not a
+// contiguous range: the robot runs them through the same motion
+// path, so the SAME timeout, the SAME priority rules and the SAME
+// "exactly one source owns the wheels" guarantee must apply to them.
+// Leaving them out would be a silent hole in the safety model.
 static inline bool walle_cmd_is_motion(uint8_t c) {
-    return c >= WALLE_CMD_MOVE_FORWARD && c <= WALLE_CMD_ROTATE_RIGHT;
+    return (c >= WALLE_CMD_MOVE_FORWARD && c <= WALLE_CMD_ROTATE_RIGHT) ||
+           c == WALLE_CMD_MOVE_STEPS ||
+           c == WALLE_CMD_TURN_AROUND ||
+           c == WALLE_CMD_TURN_DEGREES;
 }
 
 static inline const char* walle_command_name(uint8_t c) {
@@ -96,6 +141,14 @@ static inline const char* walle_command_name(uint8_t c) {
         case WALLE_CMD_IDLE:           return "idle";
         case WALLE_CMD_AUTONOMOUS_ON: return "autonomous_on";
         case WALLE_CMD_AUTONOMOUS_OFF:return "autonomous_off";
+        case WALLE_CMD_TALK:          return "talk";
+        case WALLE_CMD_JOKE:          return "joke";
+        case WALLE_CMD_MOVE_STEPS:    return "move_steps";
+        case WALLE_CMD_TURN_AROUND:   return "turn_around";
+        case WALLE_CMD_TURN_DEGREES:  return "turn_degrees";
+        case WALLE_CMD_READ_SENSOR:   return "read_sensor";
+        case WALLE_CMD_ASK:           return "ask";
+        case WALLE_CMD_SPEAK:         return "speak";
         case WALLE_CMD_EXPR_HAPPY:     return "expression_happy";
         case WALLE_CMD_EXPR_THINKING:  return "expression_thinking";
         case WALLE_CMD_EXPR_SURPRISED: return "expression_surprised";
@@ -122,6 +175,8 @@ enum WalleStatus : uint8_t {
     WALLE_ST_REMOTE_STATE,     // arg = WalleRemoteState
     WALLE_ST_BATTERY,          // arg = millivolts, 0 = unknown/no sensor
     WALLE_ST_PONG,             // reply to PING, arg = robot state
+    WALLE_ST_SENSOR,           // value = WalleCliffState, arg = ground mm
+    WALLE_ST_CLIFF,            // value = WalleCliffState (transition only)
 };
 
 enum WalleError : uint8_t {
@@ -130,7 +185,42 @@ enum WalleError : uint8_t {
     WALLE_ERR_UNKNOWN_CMD,     // not in WalleCommand
     WALLE_ERR_NOT_CONFIGURED,  // e.g. motors have no pins
     WALLE_ERR_BUSY,            // another source owns the motors
+    WALLE_ERR_CLIFF,           // refused: the sensor says there is a drop
+    WALLE_ERR_SENSOR_FAULT,    // refused: the sensor is not reporting at all
+    WALLE_ERR_BAD_ARG,         // argument out of range (e.g. 0 steps)
+    WALLE_ERR_LINK_TIMEOUT,    // the controller went quiet while driving; the
+                               // robot stopped itself. Send something every
+                               // REMOTE_TIMEOUT_MS / APP_TIMEOUT_MS.
 };
+
+// ------------------------------------------------------------
+//  Cliff sensor state
+//  ------------------------------------------------------------
+//  WALL-E's HC-SR04 points DOWN at SENSOR_MOUNT_ANGLE_DEG and watches
+//  the floor in front of the wheels. While there is floor the ground
+//  distance is SENSOR_NOMINAL_GROUND_CM; at the edge of a table the
+//  floor disappears, the reading grows, and the robot must stop.
+//
+//  This mirrors robot_s3/src/cliff_sensor.h so a controller can draw
+//  the same picture without including the robot firmware.
+enum WalleCliffState : uint8_t {
+    WALLE_CLIFF_UNKNOWN = 0,   // pins unset, or no reading yet
+    WALLE_CLIFF_GROUND  = 1,   // floor found, safe to drive
+    WALLE_CLIFF_WARN    = 2,   // closer to the edge than the warn band
+    WALLE_CLIFF_DROP    = 3,   // no floor -> STOP
+    WALLE_CLIFF_FAULT   = 4,   // sensor not responding -> STOP (fail safe)
+};
+
+static inline const char* walle_cliff_state_name(uint8_t s) {
+    switch (s) {
+        case WALLE_CLIFF_UNKNOWN: return "unknown";
+        case WALLE_CLIFF_GROUND:  return "ground";
+        case WALLE_CLIFF_WARN:    return "warn";
+        case WALLE_CLIFF_DROP:    return "drop";
+        case WALLE_CLIFF_FAULT:   return "fault";
+        default:                  return "?";
+    }
+}
 
 // Mirrors RemoteLinkState in robot_s3/src/remote_link.h so the
 // remote can render it without including robot firmware.
@@ -209,4 +299,71 @@ static inline bool walle_packet_valid(const WallePacket& p, uint8_t len) {
     return len == WALLE_PROTO_PACKET_SIZE &&
            p.magic   == WALLE_PROTO_MAGIC &&
            p.version == WALLE_PROTO_VERSION;
+}
+
+// ============================================================
+//  TEXT FRAMES (WALLE_MSG_TEXT)
+//  ------------------------------------------------------------
+//  The 10-byte packet has no room for words, so text uses a second
+//  frame: a fixed 8-byte header followed by `len` UTF-8 bytes.
+//
+//    [0] magic    0xA5
+//    [1] version  0x01
+//    [2] type     0x03 (WALLE_MSG_TEXT)
+//    [3] op       WalleTextOp
+//    [4] flags    WALLE_FLAG_*
+//    [5..6] len   uint16 LE, payload byte count (0..WALLE_TEXT_MAX)
+//    [7] reserved 0
+//    [8 .. 8+len-1]  UTF-8 payload, no terminator, no quotes
+//
+//  WHY A SEPARATE FRAME AND NOT A BIGGER PACKET
+//  -------------------------------------------
+//  WallePacket is fixed at 10 bytes on purpose: that is comfortably
+//  inside an ESP-NOW payload, and a fixed size means a receiver can
+//  validate and dispatch a frame with no buffering. A variable
+//  "say this exact sentence" field would force every controller to
+//  buffer, reassemble and length-check, and would break the ESP-NOW
+//  path for the sake of a feature only a phone can actually use.
+//
+//  So: fixed packets on the radio, fixed-packet framing on TCP, and
+//  this length-prefixed frame only on the app link. WALLE_CMD_ASK and
+//  WALLE_CMD_SPEAK announce that a text frame follows; the text frame
+//  carries the actual words.
+// ============================================================
+#define WALLE_PROTO_TEXT_HEADER 8
+#define WALLE_TEXT_MAX           240   // matches TTS_MAX_CHARS; keeps RAM small
+
+enum WalleTextOp : uint8_t {
+    WALLE_OP_ASK   = 0x01,   // controller -> robot: the question / prompt
+    WALLE_OP_SPEAK = 0x02,   // controller -> robot: say exactly this
+    WALLE_OP_REPLY = 0x03,   // robot -> controller: WALL-E's answer
+};
+
+static inline const char* walle_text_op_name(uint8_t op) {
+    switch (op) {
+        case WALLE_OP_ASK:   return "ask";
+        case WALLE_OP_SPEAK: return "speak";
+        case WALLE_OP_REPLY: return "reply";
+        default:             return "?";
+    }
+}
+
+struct WalleTextHeader {
+    uint8_t magic;
+    uint8_t version;
+    uint8_t type;
+    uint8_t op;
+    uint8_t flags;
+    uint16_t len;        // little endian, host order after htons()-free copy
+    uint8_t reserved;
+};
+
+// Validates only the fixed part; `len` must still be checked against
+// WALLE_TEXT_MAX by the caller before the payload is read.
+static inline bool walle_text_valid(const WalleTextHeader& h, uint8_t op) {
+    return h.magic   == WALLE_PROTO_MAGIC &&
+           h.version == WALLE_PROTO_VERSION &&
+           h.type    == WALLE_MSG_TEXT &&
+           h.op      == op &&
+           h.len     > 0 && h.len <= WALLE_TEXT_MAX;
 }

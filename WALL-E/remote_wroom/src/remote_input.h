@@ -16,7 +16,7 @@
 #include "config.h"
 #include "walle_protocol.h"
 
-#define REMOTE_MAX_BUTTONS 9
+#define REMOTE_MAX_BUTTONS 11
 
 class Button {
 public:
@@ -54,6 +54,8 @@ enum RemoteButtonId {
     RBTN_MODE,
     RBTN_EXPR,
     RBTN_SURPRISE,
+    RBTN_TALK,        // "say something out loud"
+    RBTN_TURN,        // "turn around" - 180 degrees, stops on its own
     RBTN_COUNT
 };
 

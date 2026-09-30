@@ -56,6 +56,28 @@
 #define BTN_EXPR_PIN      TODO_CONFIGURE_REMOTE_GPIO
 #define BTN_SURPRISE_PIN  TODO_CONFIGURE_REMOTE_GPIO
 
+// "Tell the ROBOT to say something out loud".
+//
+// This is NOT the same as BTN_TALK_PIN in section 5d below:
+//   BTN_TALK_SEND_PIN - pure ESP-NOW. The robot thinks of a line,
+//                       sends it to Gemini and speaks it out loud
+//                       through ITS OWN speaker. No PC, no app, no
+//                       internet other than the robot's Gemini key.
+//   BTN_TALK_PIN      - the old hold-to-talk voice path through the PC
+//                       app (section 5d). Leave it unset if you have
+//                       removed that path.
+// Both may be unset; the rest of the remote works either way.
+#define BTN_TALK_SEND_PIN TODO_CONFIGURE_REMOTE_GPIO
+
+// "Turn around" - pivot 180 degrees and stop by itself.
+//
+// Unlike the direction buttons this is NOT a held command: the robot
+// times the turn from its own geometry and finishes on its own, so
+// there is nothing to re-send and no STOP to forget. It is still
+// subject to the robot's cliff sensor: if the turn would walk into a
+// drop the robot stops instead.
+#define BTN_TURN_PIN      TODO_CONFIGURE_REMOTE_GPIO
+
 // Optional on-board LED showing link state. -1 disables it.
 #define REMOTE_LED_PIN    TODO_CONFIGURE_REMOTE_GPIO
 

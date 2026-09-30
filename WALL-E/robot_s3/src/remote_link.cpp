@@ -156,15 +156,14 @@ void RemoteLink::handlePacket(const uint8_t* mac, const uint8_t* data, int len) 
     // this call, so a new controller needs no changes here.
     commands.dispatch(p.cmd, SOURCE_REMOTE);
 
-    // ---- light acknowledgement ----
-    // One small status frame per command; the remote shows the
-    // command name. Deliberately not a continuous stream.
+    // HELLO and PING get a protocol-level reply here. Everything else
+    // is acknowledged by the dispatcher itself, which fans the ack out
+    // to every controller - sending one here as well would just give
+    // the remote two acks per command.
     if (p.cmd == WALLE_CMD_PING) {
         sendStatus(WALLE_ST_PONG, (uint8_t)commands.robotState());
     } else if (p.cmd == WALLE_CMD_HELLO) {
         sendStatus(WALLE_ST_WELCOME, (uint8_t)commands.robotState());
-    } else {
-        sendAck(p.cmd);
     }
 }
 

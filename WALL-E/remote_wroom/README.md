@@ -76,6 +76,19 @@ Until you do, the firmware still flashes and boots, and says so honestly:
 | `BTN_MODE_PIN` | `autonomous_on` / `autonomous_off` | **tap toggles** autonomy |
 | `BTN_EXPR_PIN` | `expression_happy` | optional |
 | `BTN_SURPRISE_PIN` | `expression_surprised` | optional |
+| `BTN_TALK_SEND_PIN` | `talk` | optional — **ask the robot to speak out loud** |
+| `BTN_TURN_PIN` | `turn_around` | optional — **180° pivot that stops by itself** |
+
+> `BTN_TALK_SEND_PIN` is pure ESP-NOW: the robot thinks of a line, sends it to
+> Gemini and speaks it through **its own** speaker. No PC, no app, and the
+> remote never holds the API key or any audio. It is a *different* button from
+> `BTN_TALK_PIN` in section 5d of `config.h`, which is the older hold-to-talk
+> path through the PC app — leave that one unset if you have removed it.
+
+> `BTN_TURN_PIN` is a **tap, not a hold**. The robot times the 180° pivot from
+> its own geometry and finishes on its own, so there is no key-repeat and no
+> STOP to forget. It is still subject to the robot's cliff sensor: if the turn
+> would walk off the table the robot stops instead of completing it.
 
 Wiring: connect each button between its GPIO and **GND**. The internal
 pull-ups are enabled, so no external resistor is needed. Flip

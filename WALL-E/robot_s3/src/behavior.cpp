@@ -6,6 +6,12 @@
 #include "camera_manager.h"
 #include "wifi_manager.h"
 #include "gemini_client.h"
+#include "tts_client.h"
+#include "audio_output.h"
+#include "cliff_sensor.h"
+#include "maneuver.h"
+#include "command_dispatch.h"
+#include "safety.h"
 
 static const char* TAG = "ROBOT";
 static const char* TAGAI = "AI";
@@ -13,6 +19,7 @@ static const char* TAGAI = "AI";
 Behavior behavior;
 
 GeminiClient gemini;
+TtsClient    tts;
 
 // The firmware only decides WHEN to be funny; Gemini writes the actual line.
 const char* Behavior::kJokePrompt =
@@ -37,10 +44,70 @@ void Behavior::halt() {
     _prompt = "";
     _reply = "";
     _jokeMode = false;
+    _speakReplies = (TTS_SPEAK_REPLIES != 0);
     dance.stop();
+    maneuver.cancel("halt");     // no timed motion may outlive a halt
+    speaker.stop();               // cut off any audio mid-sentence
     motors.emergencyStop();
-    _sm->request(STATE_IDLE);
+    if (_sm) _sm->request(STATE_IDLE);
     oled.setExpression(EXPR_IDLE);
+
+    // Releases the voice block so WALL-E can drive again afterwards.
+    safety.noteVoiceEnd();
+}
+
+// ------------------------------------------------------------
+//  Bring the wheels to a stop before WALL-E says anything.
+//
+//  Every entry point into a conversation goes through this one
+//  function. That is what guarantees there is no code path which asks
+//  Gemini or TTS while a wheel is still turning.
+// ------------------------------------------------------------
+void Behavior::parkForVoice() {
+    dance.stop();
+    maneuver.cancel("answering");
+    motors.emergencyStop();
+
+    // Tells the safety guard to refuse motion for as long as the
+    // conversation lasts, so no controller can drive it mid-sentence.
+    safety.noteVoiceStart();
+
+    if (_sm) _sm->request(STATE_THINKING);
+}
+
+// ------------------------------------------------------------
+//  Speak arbitrary text (no Gemini involved).
+//  Reuses the conversation machinery so the speaking state, the face
+//  and the error handling are identical to a normal reply.
+// ------------------------------------------------------------
+void Behavior::requestSpeak(const String& text) {
+    if (text.length() == 0) return;
+    if (_conv != CONV_IDLE_STEP) { LOGW(TAG, "Busy, ignoring speak request"); return; }
+
+    // Stop first: the wheels are going quiet before the amp comes on.
+    parkForVoice();
+
+    if (!tts.ready()) {
+        LOGW(TAG, "TTS unavailable");
+        oled.setExpression(EXPR_ERROR);
+        oled.setStatus("tts?");
+        safety.noteVoiceEnd();
+        if (_sm) _sm->request(STATE_IDLE);
+        return;
+    }
+    if (!speaker.ready()) {
+        LOGW(TAG, "No speaker wired");
+        oled.setStatus("no spk");
+        safety.noteVoiceEnd();
+        if (_sm) _sm->request(STATE_IDLE);
+        return;
+    }
+
+    _reply = text;
+    _speakReplies = true;
+    oled.setCaption(_reply.c_str());
+    if (_sm) _sm->request(STATE_SPEAKING);
+    _conv = CONV_TTS_STEP;
 }
 
 // A remote (or app) movement command took the wheels: park the
@@ -64,7 +131,7 @@ void Behavior::requestChat(const String& prompt) {
     _prompt   = prompt;
     _reply    = "";
     _jokeMode = false;
-    _sm->request(STATE_THINKING);
+    parkForVoice();                 // stops the wheels BEFORE the request
     _conv = CONV_GEMINI_REQUEST;
 }
 void Behavior::requestDance()  { if (_conv != CONV_IDLE_STEP) return; _sm->request(STATE_DANCING); }
@@ -75,7 +142,7 @@ void Behavior::requestJoke() {
     _reply    = "";
     _prompt   = "";
     _jokeMode = true;
-    _sm->request(STATE_THINKING);
+    parkForVoice();                 // stops the wheels BEFORE the request
     _conv = CONV_GEMINI_REQUEST;
 }
 
@@ -174,9 +241,44 @@ void Behavior::updateConversation(uint32_t now) {
                 conversationFinished(now);
                 return;
             }
-            // No TTS any more: the reply is shown on the OLED
-            // caption (and forwarded to the app by the caller).
+            // The reply is always shown on the face, and — when a
+            // speaker is wired — spoken out loud through Gemini TTS.
             oled.setCaption(_reply.c_str());
+            if (_speakReplies) {
+                advanceConversation(CONV_TTS_STEP, now);
+                break;
+            }
+            conversationFinished(now);
+            break;
+        }
+
+        // ---- speak the reply (streams audio straight to the amp) ----
+        case CONV_TTS_STEP: {
+            _sm->request(STATE_SPEAKING);
+
+            if (!tts.ready()) {
+                LOGW(TAG, "TTS unavailable - reply stays on the face");
+                conversationFinished(now);
+                return;
+            }
+            if (!tts.speak(_reply)) {
+                // Never let a speech failure become a robot failure.
+                oled.setExpression(EXPR_CONFUSED);
+                oled.setStatus("tts?");
+                LOGW(TAG, "Speech failed, carrying on silently");
+                conversationFinished(now);
+                return;
+            }
+            // Keep the SPEAKING face up until the audio has actually
+            // finished playing, not just until it finished downloading.
+            if (speaker.busy()) { advanceConversation(CONV_PLAYING, now); break; }
+            conversationFinished(now);
+            break;
+        }
+
+        // ---- wait for the speaker to drain ----
+        case CONV_PLAYING: {
+            if (speaker.busy()) break;              // main loop pumps it
             conversationFinished(now);
             break;
         }
@@ -189,6 +291,13 @@ void Behavior::updateConversation(uint32_t now) {
 }
 
 void Behavior::conversationFinished(uint32_t now) {
+    // Push the answer out while it still exists in _reply: the app is
+    // the one controller that can show words, the OLED caption is only
+    // 21 characters.
+    if (_reply.length() > 0) {
+        commands.notifyText(WALLE_OP_REPLY, _reply.c_str());
+    }
+
     _prompt = "";
     _reply  = "";
     _conv = CONV_IDLE_STEP;
@@ -198,6 +307,9 @@ void Behavior::conversationFinished(uint32_t now) {
     oled.setExpression(EXPR_IDLE);
     _lastSelfChatMs = now;
     scheduleNextSelfChat(now);
+
+    // Only now may the wheels move again.
+    safety.noteVoiceEnd();
 }
 
 // ------------------------------------------------------------
@@ -215,6 +327,14 @@ void Behavior::updateIdle(uint32_t now) {
 
     if (WALLE_ENABLE_WIFI && wifi.configured() && !wifi.connected()) return;
     if (now < _exploreNextMs) return;
+
+    // Do not start anything while the safety guard is unhappy. A cliff
+    // stop, a dead sensor or WALL-E answering a question all mean the
+    // robot must stay where it is.
+    if (!safety.wheelsAllowed()) {
+        motors.stop();
+        return;
+    }
 
     const int roll = esp_random() % 100;
     if (roll < JOKE_CHANCE_PCT) {
@@ -237,13 +357,37 @@ void Behavior::updateIdle(uint32_t now) {
 void Behavior::updateExploration(uint32_t now) {
     if (now < _exploreNextMs) return;
 
-    float proximity = 1.0f;
+    // The safety guard owns the cliff reaction. While it is unhappy
+    // (a drop, a dead sensor, a conversation in progress) exploration
+    // must not plan anything new - the guard is already stopping the
+    // robot and walking it backwards off the edge.
+    if (!safety.wheelsAllowed()) {
+        motors.stop();
+        _sm->request(STATE_IDLE);
+        return;
+    }
+
+    // How close to the edge, 0..1. Used to avoid choosing a fast move
+    // when the floor is running out.
+    float proximity = 0.0f;
     const bool blocked = _obstacles && _obstacles->detect(&proximity);
 
     if (blocked) {
-        // Only reachable once a real detector is implemented - see
-        // ObstacleDetector in behavior.h.
-        LOGI(TAG, "Obstacle detected, turning away");
+        // Normally unreachable, because safety.update() has already
+        // reacted to the same sensor before we get here. Kept so a
+        // DIFFERENT detector (a front ToF, a bump switch) plugged in
+        // later still works without changing this file.
+        LOGI(TAG, "Obstacle detected (%.0f%%), turning away", (double)(proximity * 100));
+        motors.stop();
+        motors.turnRight(SPEED_TURN);
+        _sm->request(STATE_MOVING);
+        _exploreNextMs = now + randomRange(EXPLORE_MOVE_MS_MIN, EXPLORE_MOVE_MS_MAX);
+        return;
+    }
+
+    // Near the limit: turn rather than drive on.
+    if (proximity > 0.6f) {
+        LOGI(TAG, "Edge close (%.0f%%), turning", (double)(proximity * 100));
         motors.stop();
         motors.turnRight(SPEED_TURN);
         _sm->request(STATE_MOVING);
