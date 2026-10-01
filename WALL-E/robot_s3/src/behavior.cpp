@@ -11,6 +11,7 @@
 #include "cliff_sensor.h"
 #include "maneuver.h"
 #include "command_dispatch.h"
+#include "persona.h"
 #include "safety.h"
 
 static const char* TAG = "ROBOT";
@@ -32,6 +33,15 @@ void Behavior::begin(RobotStateMachine* sm) {
     _conv = CONV_IDLE_STEP;
     _exploreNextMs = 0;
     _lastSelfChatMs = millis();
+
+    // Start with the compiled-in personality, so the robot has a voice
+    // even before the app has connected and sent its own.
+    persona.begin();
+
+    // Push it into the AI client now, and again before every request:
+    // the app may replace the persona at any time while connected.
+    gemini.setSystemInstruction(persona.prompt());
+    LOGI(TAG, "I am %s", persona.name());
 }
 
 uint32_t Behavior::randomRange(uint32_t min, uint32_t max) {
@@ -201,9 +211,11 @@ void Behavior::update(uint32_t now) {
         case STATE_IDLE:      updateIdle(now);      break;
         case STATE_OFFLINE:   oled.setStatus("offline"); break;
 
-        case STATE_REMOTE_MANUAL:
-            // The remote link owns the motors here (and stops them on
-            // release, timeout or link loss). Nothing for us to do.
+        case STATE_MANUAL:
+            // The app owns the motors here, and the dispatcher stops
+            // them on release, timeout or link loss. Nothing for us to
+            // do, and in particular nothing here may restart autonomy
+            // behind the app's back.
             break;
 
         default:
@@ -232,6 +244,10 @@ void Behavior::updateConversation(uint32_t now) {
             _sm->request(STATE_THINKING);
             if (!gemini.ready()) { oled.setExpression(EXPR_ERROR); conversationFinished(now); return; }
 
+            // The persona may have been replaced by the app since the
+            // last question, so re-read it every single time.
+            gemini.setSystemInstruction(persona.prompt());
+
             bool ok = _jokeMode ? gemini.askWithPrompt("Go on then.", kJokePrompt, &_reply)
                                 : gemini.ask(_prompt, &_reply);
             _jokeMode = false;
@@ -241,6 +257,12 @@ void Behavior::updateConversation(uint32_t now) {
                 conversationFinished(now);
                 return;
             }
+
+            // The persona's suffix, added here rather than being
+            // trusted to the model: Gemini is told to add it, but the
+            // robot must not depend on that to sound like itself.
+            persona.decorate(&_reply);
+
             // The reply is always shown on the face, and — when a
             // speaker is wired — spoken out loud through Gemini TTS.
             oled.setCaption(_reply.c_str());

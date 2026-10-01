@@ -19,10 +19,14 @@
 //    a dance routine.
 //  * TTS: Gemini replies are spoken out loud through the I2S amplifier.
 //    The audio stack is only loaded while something is actually being
-//    said. Speech-to-Text is NOT here - the robot has no microphone.
-//  * THREE controllers, ONE dispatcher: the ESP32-WROOM radio remote
-//    over ESP-NOW, the companion app over TCP, and the serial console.
-//    Every command lands in the same command_dispatch.cpp.
+//    said. Speech-to-Text is NOT here - the robot has no microphone;
+//    the app does the speech recognition and sends the words as text.
+//  * The personality is the APP's: it sends a persona after connecting
+//    (src/persona.*), so who WALL-E is can change without a reflash.
+//  * ONE controller: the companion app, over TCP (src/app_link.*).
+//    There is no handheld radio remote and no ESP-NOW any more.
+//    Everything lands in the same command_dispatch.cpp, which is the
+//    only place a command means anything.
 //
 //  LOOP ORDER IS A SAFETY DECISION, NOT A STYLE CHOICE
 //  --------------------------------------------------
@@ -47,11 +51,11 @@
 #include "behavior.h"
 #include "dance.h"
 #include "camera_manager.h"
-#include "remote_link.h"
 #include "app_link.h"
 #include "command_dispatch.h"
 #include "cliff_sensor.h"
 #include "maneuver.h"
+#include "persona.h"
 #include "safety.h"
 #include "audio_output.h"
 #include "hardware_test.h"
@@ -100,20 +104,12 @@ void setup() {
     // ---------- 5. Wi-Fi (never blocks forever) ----------
     wifi.begin();
 
-    // ---------- 6. controllers ----------
-#if WALLE_ENABLE_REMOTE
-    if (remoteLink.begin()) {
-        oled.setStatus("remote?");
-    } else {
-        LOGW("S3", "Remote link unavailable - serial control only");
-    }
-#endif
-
+    // ---------- 6. the app link: the only controller ----------
 #if WALLE_ENABLE_APP_LINK
     if (appLink.begin()) {
         LOGI("S3", "App link ready - connect a TCP client to port %d", APP_TCP_PORT);
     } else {
-        LOGW("S3", "App link unavailable");
+        LOGW("S3", "App link unavailable - serial control only");
     }
 #endif
 
@@ -139,25 +135,11 @@ void loop() {
     // 2. sensors
     cliffSensor.update(now);
 
-    // 3. controllers
-#if WALLE_ENABLE_REMOTE
-    remoteLink.update(now);        // ESP-NOW RX, timeout watchdog, status
-#endif
+    // 3. the app (and the console)
 #if WALLE_ENABLE_APP_LINK
     appLink.update(now);           // TCP accept / drain / watchdog
 #endif
     commands.tick(now);            // stale-motion backstop
-
-    // Show link state on the face, but only when it CHANGES. Rewriting
-    // the same status string every loop would fight the behaviour
-    // layer for the OLED status line and flicker it.
-#if WALLE_ENABLE_REMOTE
-    static RemoteLinkState lastRemoteState = REMOTE_DISCONNECTED;
-    if (remoteLink.state() != lastRemoteState) {
-        lastRemoteState = remoteLink.state();
-        oled.setStatus(remoteLink.statusText());
-    }
-#endif
 
     // 4. a timed maneuver advances, or is aborted by the guard
     maneuver.update(now);

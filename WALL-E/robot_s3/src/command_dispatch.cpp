@@ -6,18 +6,20 @@
 #include "behavior.h"
 #include "cliff_sensor.h"
 #include "dance.h"
+#include "gemini_client.h"
 #include "log.h"
 #include "maneuver.h"
 #include "motor_controller.h"
 #include "oled_display.h"
-#include "remote_link.h"
+#include "persona.h"
 #include "app_link.h"
 #include "robot_state.h"
 #include "safety.h"
 #include "tts_client.h"
 #include "audio_output.h"
 
-extern TtsClient tts;   // single instance, owned by behavior.cpp
+extern TtsClient tts;      // single instances, owned by behavior.cpp
+extern GeminiClient gemini;
 
 static const char* TAG = "S3";
 
@@ -25,19 +27,10 @@ CommandDispatcher commands;
 
 namespace {
 
-// The remote's control window. Same value as REMOTE_CONTROL_HOLD_MS
-// in config.h; the dispatcher is the consumer, the link is the owner.
-constexpr uint32_t kControlHoldMs = REMOTE_CONTROL_HOLD_MS;
-
-// If a movement command somehow survives this long without the state
-// machine changing anything, stop anyway. This is the belt to the
-// link's braces: MAX_DRIVE_MS is the absolute motor watchdog.
-constexpr uint32_t kMotionSafetyMs = MAX_DRIVE_MS;
-
 uint32_t gMotionStartedMs = 0;
 
 // Reflects a held motion command onto the wheels. Every value a
-// controller can ask for is in this table - a controller never sends
+// controller can ask for is in this table - the app never sends
 // speeds, it only names the direction.
 void applyMotion(uint8_t command) {
     switch (command) {
@@ -52,10 +45,6 @@ void applyMotion(uint8_t command) {
     gMotionStartedMs = millis();
 }
 
-bool motionActive() {
-    return gMotionStartedMs != 0 && (millis() - gMotionStartedMs) < kMotionSafetyMs;
-}
-
 void stopMotion() {
     gMotionStartedMs = 0;
     // A controller press also cancels anything the robot was doing on
@@ -64,13 +53,23 @@ void stopMotion() {
     motors.stop();
 }
 
+// Maps a safety block onto the error the app knows how to explain.
+// The wording lives in the app, not here: the firmware only says what
+// happened.
+uint8_t errorForBlock(uint8_t reason) {
+    switch (reason) {
+        case WHEELS_BLOCKED_CLIFF:  return WALLE_ERR_CLIFF;
+        case WHEELS_BLOCKED_SENSOR: return WALLE_ERR_SENSOR_FAULT;
+        default:                    return WALLE_ERR_BUSY;
+    }
+}
+
 }  // namespace
 
 // ------------------------------------------------------------
-//  Outbound status - fanned out to every controller
+//  Outbound status
 // ------------------------------------------------------------
 void CommandDispatcher::notify(uint8_t status, uint8_t value, uint16_t arg) {
-    remoteLink.sendStatus(status, value, arg);
     appLink.sendStatus(status, value, arg);
 }
 
@@ -90,9 +89,8 @@ void CommandDispatcher::notifyText(uint8_t op, const char* text) {
 // ------------------------------------------------------------
 const char* CommandDispatcher::sourceName(CommandSource s) {
     switch (s) {
-        case SOURCE_REMOTE:   return "remote";
-        case SOURCE_SERIAL:   return "serial";
         case SOURCE_APP:      return "app";
+        case SOURCE_SERIAL:   return "serial";
         case SOURCE_INTERNAL: return "internal";
         case SOURCE_NONE:     return "none";
         default:              return "?";
@@ -107,22 +105,7 @@ void CommandDispatcher::releaseControl() {
     _owner = SOURCE_NONE;
     _maneuverByOwner = false;
     safety.setExternallyDriven(false);
-    remoteLink.setDriving(false);
     appLink.setDriving(false);
-}
-
-void CommandDispatcher::onRemoteLost() {
-    const bool wasOwner = (_owner == SOURCE_REMOTE);
-    stopMotion();
-    if (wasOwner) releaseControl();
-
-    if (gRobotSM && gRobotSM->state() == STATE_REMOTE_MANUAL) {
-        gRobotSM->request(STATE_IDLE);
-    }
-    if (wasOwner) {
-        safety.forceStop("remote lost");
-        LOGW(TAG, "Remote control released");
-    }
 }
 
 void CommandDispatcher::onAppLost() {
@@ -136,11 +119,30 @@ void CommandDispatcher::onAppLost() {
     }
 }
 
+// ------------------------------------------------------------
+//  The persona
+// ------------------------------------------------------------
+void CommandDispatcher::setPersona(const char* json) {
+    if (persona.apply(json)) {
+        // Apply it to the AI client immediately rather than waiting for
+        // the next question, so a change is visible even if the robot
+        // is mid-conversation.
+        gemini.setSystemInstruction(persona.prompt());
+        LOGI(TAG, "Persona accepted: %s", persona.name());
+        notifyAck(WALLE_CMD_SET_PERSONA);
+    } else {
+        // The previous persona is untouched: all or nothing.
+        LOGW(TAG, "Persona rejected - keeping the old one");
+        notifyError(WALLE_ERR_BAD_ARG);
+    }
+}
+
+// ------------------------------------------------------------
 void CommandDispatcher::tick(uint32_t now) {
     // A timed maneuver runs to completion by itself. When it does, hand
-    // the wheels back: otherwise a controller that asked for "4 steps"
-    // would keep the lock until somebody pressed STOP, and every other
-    // source - including WALL-E's own autonomy - would be refused.
+    // the wheels back: otherwise the app that asked for "4 steps" would
+    // keep the lock until somebody pressed STOP, and WALL-E's own
+    // autonomy would stay locked out.
     if (_maneuverByOwner && !maneuver.busy()) {
         LOGI(TAG, "%s maneuver finished", sourceName(_owner));
         releaseControl();
@@ -149,27 +151,24 @@ void CommandDispatcher::tick(uint32_t now) {
         }
     }
 
-    // Backstop: a held button re-sends every REMOTE_REPEAT_MS, so a
-    // motion command older than the control window means something went
-    // wrong upstream. Stop rather than assume.
+    // Backstop: the app re-sends a held command every
+    // APP_HELD_REPEAT_MS, so a motion command older than four times
+    // the control window means something went wrong upstream.
     if (_owner != SOURCE_NONE && gMotionStartedMs != 0 &&
-        (now - _lastRemoteMotionMs) > kControlHoldMs * 4) {
+        (now - _lastMotionMs) > APP_CONTROL_HOLD_MS * 4) {
         LOGW(TAG, "Stale motion from %s -> STOP", sourceName(_owner));
-        const CommandSource owner = _owner;
         stopMotion();
         releaseControl();
         safety.forceStop("stale motion");
-        if (owner == SOURCE_REMOTE) onRemoteLost();
-        else if (owner == SOURCE_APP)  onAppLost();
+        onAppLost();
     }
 }
 
 // ------------------------------------------------------------
-//  A held movement command (remote / app direction buttons)
+//  A held movement command (the app's direction buttons)
 // ------------------------------------------------------------
 bool CommandDispatcher::runMotion(uint8_t command, CommandSource source) {
-
-    // P1: only one controller may own the wheels.
+    // Only one controller may own the wheels.
     if (_owner != SOURCE_NONE && _owner != source) {
         LOGW(TAG, "%s: %s refused, %s has control",
              sourceName(source), walle_command_name(command), sourceName(_owner));
@@ -183,22 +182,24 @@ bool CommandDispatcher::runMotion(uint8_t command, CommandSource source) {
         LOGW(TAG, "%s: %s refused, wheels blocked (%s)",
              sourceName(source), walle_command_name(command),
              SafetyGuard::reasonName(reason));
-        notifyError(reason == WHEELS_BLOCKED_CLIFF   ? WALLE_ERR_CLIFF :
-                    reason == WHEELS_BLOCKED_SENSOR  ? WALLE_ERR_SENSOR_FAULT :
-                                                       WALLE_ERR_BUSY);
+        notifyError(errorForBlock(reason));
         return false;
     }
 
     behavior.suspendAutonomy(millis());   // park self-driving behaviour
-    stopMotion();                          // a press cancels any maneuver
+
+    // stopMotion(), not maneuver.stop(): this also clears the held-motion
+    // timestamp. Leaving it set would make commands.tick() believe a
+    // stale button was still held and cut a long maneuver short.
+    stopMotion();
+
     applyMotion(command);
-    _lastRemoteMotionMs = millis();
+    _lastMotionMs = millis();
     _owner = source;
     safety.setExternallyDriven(true);
-    if (source == SOURCE_REMOTE) remoteLink.setDriving(true);
-    if (source == SOURCE_APP)    appLink.setDriving(true);
+    appLink.setDriving(true);
 
-    gRobotSM->request(STATE_REMOTE_MANUAL);
+    gRobotSM->request(STATE_MANUAL);
     LOGI(TAG, "%s: %s", sourceName(source), walle_command_name(command));
     return true;
 }
@@ -219,27 +220,15 @@ bool CommandDispatcher::runManeuver(uint8_t command, CommandSource source, uint1
         LOGW(TAG, "%s: %s refused, wheels blocked (%s)",
              sourceName(source), walle_command_name(command),
              SafetyGuard::reasonName(reason));
-        notifyError(reason == WHEELS_BLOCKED_CLIFF  ? WALLE_ERR_CLIFF :
-                    reason == WHEELS_BLOCKED_SENSOR ? WALLE_ERR_SENSOR_FAULT :
-                                                      WALLE_ERR_BUSY);
+        notifyError(errorForBlock(reason));
         return false;
     }
 
-    behavior.suspendAutonomy(millis());   // park self-driving behaviour
-
-    // stopMotion(), not maneuver.stop(): this also clears the held-motion
-    // timestamp. Leaving it set would make commands.tick() believe a stale
-    // button was still being held and cut a long maneuver short after
-    // kControlHoldMs * 4 - "move 20 steps" would die after 2.4 s.
-    stopMotion();
+    behavior.suspendAutonomy(millis());
+    stopMotion();          // also cancels any maneuver still in flight
 
     bool ok = false;
     if (command == WALLE_CMD_MOVE_STEPS) {
-        if (arg == 0) {
-            LOGW(TAG, "%s: move_steps with 0 steps", sourceName(source));
-            notifyError(WALLE_ERR_BAD_ARG);
-            return false;
-        }
         ok = maneuver.startForwardSteps(arg);
     } else if (command == WALLE_CMD_TURN_DEGREES) {
         ok = maneuver.startTurnDegrees(arg);
@@ -256,9 +245,8 @@ bool CommandDispatcher::runManeuver(uint8_t command, CommandSource source, uint1
     // timeout still stops it mid-move.
     _owner = source;
     safety.setExternallyDriven(true);
-    if (source == SOURCE_REMOTE) remoteLink.setDriving(true);
-    if (source == SOURCE_APP)    appLink.setDriving(true);
-    _lastRemoteMotionMs = millis();
+    appLink.setDriving(true);
+    _lastMotionMs = millis();
     _maneuverByOwner = true;
 
     gRobotSM->request(STATE_MOVING);
@@ -295,8 +283,6 @@ bool CommandDispatcher::dispatch(uint8_t command, CommandSource source, uint16_t
         const CommandSource previousOwner = _owner;
         LOGI(TAG, "%s: %s", src, walle_command_name(command));
 
-        // A STOP also ends any safety cooldown, so pressing stop then driving
-        // works: the robot must never be permanently undrivable.
         behavior.halt();                 // cancels dance, Gemini, explore
         stopMotion();
         releaseControl();
@@ -305,7 +291,7 @@ bool CommandDispatcher::dispatch(uint8_t command, CommandSource source, uint16_t
         // Only a controller STOP resumes autonomy. A stop from the
         // firmware's own safety system, or from a crashed app, parks
         // the robot so it cannot drive off by itself afterwards.
-        if (previousOwner == SOURCE_REMOTE || previousOwner == SOURCE_APP) {
+        if (previousOwner == SOURCE_APP || previousOwner == SOURCE_SERIAL) {
             behavior.setAutonomous(true);
             LOGI(TAG, "Autonomy resumed after a controller stop");
         }
@@ -344,11 +330,19 @@ bool CommandDispatcher::dispatch(uint8_t command, CommandSource source, uint16_t
         return true;
     }
 
-    // ---- text handled separately (app only) ----
+    // ---- the persona ----
+    if (command == WALLE_CMD_SET_PERSONA) {
+        // Deliberately NO ack here. This command carries no payload: the
+        // words arrive in the TEXT frame that follows, and app_link.cpp
+        // calls setPersona() when it does. Acking now would tell the app
+        // the persona was accepted before anyone had parsed it, and a
+        // malformed payload would have no way to report itself.
+        LOGI(TAG, "%s: persona frame expected next", src);
+        return true;
+    }
+
+    // ---- ask / speak: handled by the text frame that follows ----
     if (command == WALLE_CMD_ASK || command == WALLE_CMD_SPEAK) {
-        // The words arrive as a WALLE_MSG_TEXT frame right after this
-        // packet; app_link.cpp has already turned them into a
-        // behavior call. Reaching here means the text never came.
         LOGW(TAG, "%s: %s with no text frame", src, walle_command_name(command));
         notifyError(WALLE_ERR_BAD_PACKET);
         return false;
@@ -401,7 +395,7 @@ bool CommandDispatcher::dispatch(uint8_t command, CommandSource source, uint16_t
                 return false;
             }
             if (command == WALLE_CMD_JOKE) behavior.requestJoke();
-            else behavior.requestChat("Say something interesting about yourself.");
+            else behavior.requestChat("Say something interesting.");
             break;
 
         case WALLE_CMD_EXPR_HAPPY:     oled.setExpression(EXPR_HAPPY);     break;

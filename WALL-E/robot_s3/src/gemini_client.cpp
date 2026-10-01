@@ -5,6 +5,16 @@
 
 static const char* TAG = "GEMINI";
 
+void GeminiClient::setSystemInstruction(const char* text) {
+    _instruction = (text && *text) ? text : nullptr;
+    LOGI(TAG, "System instruction: %s",
+         _instruction ? _instruction : "(compiled-in default)");
+}
+
+const char* GeminiClient::systemInstruction() const {
+    return _instruction ? _instruction : GEMINI_SYSTEM_PROMPT;
+}
+
 bool GeminiClient::ask(const String& userText, String* outText) {
     return askWithPrompt(userText, nullptr, outText);
 }
@@ -15,7 +25,10 @@ bool GeminiClient::askWithPrompt(const String& userText, const char* extraPrompt
     if (!ready()) { LOGE(TAG, "No API key configured"); return false; }
     if (WiFi.status() != WL_CONNECTED) { LOGE(TAG, "Offline"); return false; }
 
-    String sys = GEMINI_SYSTEM_PROMPT;
+    // The persona's prompt, when the app has sent one, otherwise the
+    // compiled-in personality. Either way there is exactly one system
+    // instruction - a robot cannot be two characters at once.
+    String sys = systemInstruction();
     if (extraPrompt && *extraPrompt) { sys += " "; sys += extraPrompt; }
 
     JsonDocument doc;

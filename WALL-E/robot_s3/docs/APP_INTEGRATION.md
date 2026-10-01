@@ -1,18 +1,17 @@
 # WALL-E App Integration
 
-**This document is the contract between the WALL-E robot firmware and
-the companion app.** It is written so that another developer (or another
-CLI) can build the app side from this file alone, without reading the
-firmware.
+**The contract between the WALL-E robot firmware and the companion app.**
 
-The single most important thing to understand before you read the rest:
+This is written from the firmware's side and matches what the shipped app
+(`innovationday.walle.app`) already sends. If either side changes, change
+both here and in `shared/walle_protocol.h`.
 
-> **The app is not special.** It is a second controller, exactly like the
-> ESP32-WROOM radio remote. It sends the *same* 10-byte binary command
-> packets, over TCP instead of ESP-NOW, and the robot funnels both into
-> one dispatcher. If the app and the remote ever disagreed about what a
-> command means, that would be a firmware bug — not something the app
-> has to work around.
+The single most important thing to understand:
+
+> **The app is the only controller.** The ESP32-WROOM handheld remote has
+> been removed, so there is exactly one way in and exactly one set of rules.
+> The app speaks the same 10-byte binary packets, over TCP, into the same
+> `command_dispatch.cpp` the serial console uses.
 
 ---
 
@@ -20,233 +19,220 @@ The single most important thing to understand before you read the rest:
 
 | | |
 |---|---|
-| Transport | TCP |
-| Default port | `8080` (change with `APP_TCP_PORT` in `include/config.h`) |
-| Robot address | printed on the serial log at boot as its local IP |
-| Protocol | binary, little-endian, **not** HTTP, **not** JSON, **not** WebSocket |
+| Transport | raw **TCP** — not HTTP, not WebSocket, not JSON |
+| Port | **8080** (`APP_TCP_PORT`) |
+| Addressing | the robot's IP, printed on its serial log at boot |
+| Handshake | none |
+| Secret | none |
 
-There is **no handshake and no handshake secret**. Connect, and start
-sending frames. Send a `HELLO` if you want the robot to introduce
-itself.
+### How the app opens the socket
+
+A browser cannot open a raw TCP socket. The app is a Capacitor app, so it
+uses a small native plugin for exactly that:
 
 ```
-app / phone  ──TCP:8080──▶  ESP32-S3 robot
-                              ├─ parses frames
-                              ├─ safety guard: cliff sensor + voice lock
-                              └─ command_dispatch.cpp  ← the only place commands live
+React UI  →  WallETcpPlugin (Java)  →  TCP socket  →  robot
+              connect / send / close      base64 bridge
 ```
 
-### The watchdog — read this, it will bite you
+The plugin is deliberately dumb: it opens a socket and moves bytes. All
+framing, the watchdog and reconnect logic live in TypeScript on the JS
+side, because that is the only place there is one copy of it.
 
-While the app is **driving** the robot, it must send **something** at
-least once every `APP_TIMEOUT_MS` (default **700 ms**), or the robot
-stops and releases control. That is deliberate: a phone whose screen
-locks, or an app whose tab is backgrounded, must never leave the robot
-driving.
+### No discovery
 
-Keepalive options, in order of preference:
-
-1. **Re-send the movement command** every ~250 ms while the direction
-   button is held (this is what the radio remote does). Use the
-   `WALLE_FLAG_HELD` flag.
-2. Send `PING` (0x31) every ~300 ms when connected but not driving.
-
-When the robot stops an app for a timeout it sends `WALLE_ST_ERROR` with
-`LINK_TIMEOUT`, so you can show "connection lost — robot stopped" and
-restart your keepalive instead of reconnecting.
+The firmware contains no mDNS and does not advertise itself, so
+`wall-e.local` will not resolve. The app asks for the IP once and
+remembers it. `/api/scan` is a placeholder that echoes the configured
+host, not a working scanner.
 
 ---
 
-## 2. Frame formats
+## 2. The 700 ms watchdog — the thing that will bite you
 
-### 2.1 Command / status packet — 10 bytes
+While the app is **driving**, it must send **something at least every 700 ms**
+(`APP_TIMEOUT_MS`) or the robot stops and releases the wheels.
 
-```
-offset  size  field       notes
-------  ----  ----------  ------------------------------------------------
-0       1     magic       0xA5, always. Used to resynchronise the stream.
-1       1     version     0x01
-2       1     type        0x01 = COMMAND (app -> robot)
-                          0x02 = STATUS  (robot -> app)
-3       1     cmd         see the command / status tables below
-4       1     value       small argument: state, error, expression
-5       1     seq         rolling counter 0..255, wraps. Echo it back.
-6       1     flags       bit0 = WALLE_FLAG_HELD (button physically down)
-7       1     reserved    0
-8       2     arg         uint16 LE — the step count, ground distance, ...
-```
+This is deliberate. A phone whose screen locks, or an app whose tab is
+backgrounded, must never leave the robot driving.
 
-The struct is **not** padded, so it is exactly 10 bytes on the wire in
-this order. In JS pack it with `DataView` — do not use `Buffer.write` of
-a struct, the padding rules differ.
+| Situation | What the app sends |
+|---|---|
+| Direction held | re-sends the held command every **250 ms** with `FLAG_HELD` |
+| Connected, not driving | `PING` every 300 ms |
+| Finger lifts | `STOP` immediately, then disarms the keepalive |
 
-### 2.2 Text frame — 8-byte header + payload
+The app also holds a **screen wake lock** while visible, because Android
+locks an idle screen after a few seconds — and a locked screen means a
+silent app means a stopped robot mid-manoeuvre.
 
-Used only for `ask` / `speak` / the reply, and only over TCP.
-
-```
-offset  size  field       notes
-------  ----  ----------  ------------------------------------------------
-0       1     magic       0xA5
-1       1     version     0x01
-2       1     type        0x03 = TEXT
-3       1     op          0x01 ask, 0x02 speak, 0x03 reply
-4       1     flags       0
-5       2     len         uint16 LE, payload byte count, 1..240
-6       1     reserved    0
---- payload: `len` bytes of UTF-8, no terminator, no quotes, no escaping ---
-```
-
-`len` is capped at **240** on both sides; the robot truncates anything
-longer. 240 characters is roughly one short sentence of speech, which
-matches the robot's personality prompt ("1–3 short sentences") and keeps
-the Gemini TTS cost bounded.
+When the robot stops you for a timeout it sends `ERROR` / `LINK_TIMEOUT`.
+Treat that as a *notice*, not a disconnect: the link is still up, it just
+needs the keepalive running again.
 
 ---
 
-## 3. Commands (app → robot)
+## 3. Frames
 
-| Value | Name | `arg` | What the robot does |
+### 3.1 Fixed packet — 10 bytes, little endian
+
+| Offset | Size | Field | Notes |
 |---|---|---|---|
-| `0x01` | `move_forward` | – | drives forward **while held**; re-send or it stops |
-| `0x02` | `move_backward` | – | as above |
-| `0x03` | `turn_left` | – | arc left, held |
-| `0x04` | `turn_right` | – | arc right, held |
-| `0x05` | `rotate_left` | – | pivot on the spot, held |
-| `0x06` | `rotate_right` | – | pivot on the spot, held |
-| `0x07` | `stop` | – | **highest priority from any source.** Stops everything |
-| `0x10` | `dance` | – | run the dance routine |
-| `0x11` | `explore` | – | start autonomous exploration |
-| `0x12` | `idle` | – | stop and park |
-| `0x13` | `autonomous_on` | – | let WALL-E decide what to do |
-| `0x14` | `autonomous_off` | – | WALL-E only moves when told |
-| `0x15` | `talk` | – | ask Gemini for a line, then **say it out loud** |
-| `0x16` | `joke` | – | ask Gemini for a joke, then say it |
-| `0x17` | `move_steps` | step count, 1–50 | drive N steps and stop by itself |
-| `0x18` | `turn_around` | – | pivot 180° and stop by itself |
-| `0x1A` | `ask` | – | **followed immediately by a TEXT frame** with the question |
-| `0x1B` | `speak` | – | **followed immediately by a TEXT frame** to say verbatim |
-| `0x1C` | `turn_degrees` | 1–360 | pivot that many degrees and stop |
-| `0x19` | `read_sensor` | – | answer with `WALLE_ST_SENSOR` right now |
-| `0x20` | `expression_happy` | – | set the face |
-| `0x21` | `expression_thinking` | – | |
-| `0x22` | `expression_surprised` | – | |
-| `0x23` | `expression_confused` | – | |
-| `0x24` | `expression_idle` | – | |
-| `0x30` | `hello` | – | robot replies `WALLE_ST_WELCOME` with its state |
-| `0x31` | `ping` | – | robot replies `WALLE_ST_PONG` with its state |
-| `0x32` | `bye` | – | clean shutdown, robot stops immediately |
+| 0 | 1 | magic | `0xA5` always. Used to resynchronise. |
+| 1 | 1 | version | `0x01` |
+| 2 | 1 | type | `0x01` COMMAND, `0x02` STATUS, `0x03` TEXT |
+| 3 | 1 | cmd | command or status id |
+| 4 | 1 | value | small argument: state, error, expression |
+| 5 | 1 | seq | rolling counter 0–255, wraps |
+| 6 | 1 | flags | bit 0 = `WALLE_FLAG_HELD` (0x01) |
+| 7 | 1 | reserved | 0 |
+| 8 | 2 | arg | `uint16` LE — step count, degrees, millivolts |
 
-### Held vs tap
+Encode with `DataView`, never a packed struct: C struct padding rules differ
+between platforms and the firmware asserts the type is exactly 10 bytes.
 
-For `0x01`–`0x06` set `flags |= 0x01` (`WALLE_FLAG_HELD`) while the
-finger is down. The robot does not actually need the flag to keep
-driving — it stops when the commands stop arriving — but sending it
-lets the robot and the logs distinguish a press from a tap.
+### 3.2 Text frame — 8-byte header + UTF-8 payload
 
-`0x07` (`stop`) is never a held command. Always send it on release.
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | magic `0xA5` |
+| 1 | 1 | version `0x01` |
+| 2 | 1 | type `0x03` TEXT |
+| 3 | 1 | op — `0x01` ask, `0x02` speak, `0x03` reply, `0x04` persona |
+| 4 | 1 | flags |
+| 5 | 2 | len `uint16` LE, 1–240 |
+| 6–7 | | padding to 8 |
+| 8… | len | UTF-8, no terminator, no escaping |
 
-### Timed motions do not need a keepalive loop
+`ASK`, `SPEAK` and `SET_PERSONA` are announced as a fixed packet, then the
+words follow **immediately** in a text frame.
 
-`move_steps`, `turn_around` and `turn_degrees` run to completion by
-themselves. You do **not** need to re-send them and you do **not** need
-to send `stop` afterwards. They are still subject to the cliff sensor:
-the robot will cut one short if it sees a drop.
+Truncate at **240 bytes on a character boundary**, not a byte boundary:
+slicing encoded bytes at 240 can cut a 3-byte character in half and hand the
+robot invalid UTF-8.
+
+### 3.3 Stream framing — read the type byte, not the length
+
+TCP has no message boundaries: one read can return half a packet or three
+packets. The naive approach — "a frame is fixed-size unless it looks like a
+text header at offset 8" — **cannot work**, because a text frame whose total
+length happens to be 10 bytes (an 8-byte header plus 2 bytes of text) is
+indistinguishable from a fixed packet by length alone.
+
+Read the **type byte at offset 2** as soon as three bytes have arrived; it is
+unambiguous. Also drop a frame whose version byte does not follow the magic,
+so a partial frame from a previous connection is never decoded as garbage.
 
 ---
 
-## 4. Status (robot → app)
+## 4. Commands
 
-| Value | Name | Carries |
+### Locomotion (held)
+
+| Id | Name | Behaviour |
 |---|---|---|
-| `0x80` | `WELCOME` | `value` = robot state (reply to `hello`, and on connect) |
-| `0x81` | `ACK` | `cmd` = the command that ran |
-| `0x82` | `ERROR` | `value` = error code (see below) |
-| `0x83` | `ROBOT_STATE` | `value` = robot state |
-| `0x84` | `REMOTE_STATE` | `value` = radio remote state (0–3) |
-| `0x86` | `PONG` | `value` = robot state (reply to `ping`) |
-| `0x87` | `SENSOR` | `value` = cliff state, `arg` = ground distance in **cm** |
-| `0x88` | `CLIFF` | `value` = cliff state (sent on the transition) |
+| `0x01` | `move_forward` | drives while held; re-send or it stops |
+| `0x02` | `move_backward` | as above |
+| `0x03` | `turn_left` | arc left, held |
+| `0x04` | `turn_right` | arc right, held |
+| `0x05` | `rotate_left` | pivot on the spot, held |
+| `0x06` | `rotate_right` | pivot on the spot, held |
+| `0x07` | `stop` | **highest priority from any source.** Never `HELD`. |
 
-WALL-E's spoken answer is **not** a status packet — it arrives as a `TEXT`
-frame with `op = 0x03` (reply), see §5.
+### Timed motions (finish on their own)
 
-The robot also re-sends `ROBOT_STATE` about once a second as a keepalive
-floor, and pushes `SENSOR` whenever the app sends `read_sensor` and
-afterwards as state changes happen. **Do not render every `ROBOT_STATE`
-packet as a screen update** — that is what the status line is for.
-
-### Robot states (`value` of `ROBOT_STATE` / `WELCOME` / `PONG`)
-
-| # | Name | Meaning |
+| Id | Name | `arg` |
 |---|---|---|
-| 0 | `BOOT` | starting up |
-| 1 | `IDLE` | awake, not doing anything |
-| 2 | `THINKING` | waiting on Gemini — **the robot is stopped** |
-| 3 | `SPEAKING` | audio playing — **the robot is stopped** |
-| 4 | `EXPLORING` | driving itself around |
-| 5 | `OBSERVING` | paused while it looks around |
-| 6 | `MOVING` | in the middle of a timed maneuver |
-| 7 | `DANCING` | dancing |
-| 8 | `REMOTE` | a controller owns the wheels |
-| 9 | `OFFLINE` | no Wi-Fi, AI features paused |
+| `0x17` | `move_steps` | 1–50 steps (`STEP_DISTANCE_CM` = 10 cm) |
+| `0x18` | `turn_around` | — (180°) |
+| `0x1c` | `turn_degrees` | 1–360° |
+| `0x1d` | `set_persona` | then a text frame with op `0x04` — see §5 |
 
-### Cliff sensor states (`value` of `SENSOR` / `CLIFF`)
+No keepalive, and **no `stop` afterwards** — sending one is harmless but
+pointless. Still subject to the cliff sensor: a drop truncates the motion.
 
-This is the table edge detector. Showing it in the app is genuinely
-useful — it is the difference between "the robot is stuck" and "the
-robot correctly refused to walk off the table".
+### Modes
 
-| # | Name | Meaning |
+| Id | Name |
+|---|---|
+| `0x10` | `dance` |
+| `0x11` | `explore` |
+| `0x12` | `idle` |
+| `0x13` | `autonomous_on` |
+| `0x14` | `autonomous_off` |
+
+### Voice
+
+| Id | Name | Notes |
 |---|---|---|
-| 0 | `unknown` | sensor not configured, or no reading yet |
-| 1 | `ground` | floor found — safe |
-| 2 | `warn` | close to the edge — driving slowly |
-| 3 | `drop` | **no floor: the robot has stopped** |
-| 4 | `fault` | the sensor is not responding — the robot has stopped |
+| `0x15` | `talk` | the robot decides what to say, then says it |
+| `0x16` | `joke` | the robot decides the joke |
+| `0x1a` | `ask` | then a text frame with op `0x01`, the question |
+| `0x1b` | `speak` | then a text frame with op `0x02`, said verbatim |
 
-`arg` is the vertical distance from the sensor to the floor in cm. On a
-table it sits near the configured nominal value; over an edge it climbs
-fast.
+### Expressions
 
-### Errors (`value` of `ERROR`)
+| Id | Name |
+|---|---|
+| `0x20` | `expression_happy` |
+| `0x21` | `expression_thinking` |
+| `0x22` | `expression_surprised` |
+| `0x23` | `expression_confused` |
+| `0x24` | `expression_idle` |
 
-| # | Name | What the app should show |
-|---|---|---|
-| 0 | — | no error |
-| 1 | `BAD_PACKET` | framing bug — usually a wrong length or a missing magic byte |
-| 2 | `UNKNOWN_CMD` | you sent a command id that does not exist |
-| 3 | `NOT_CONFIGURED` | the robot's pins for that feature are not set yet |
-| 4 | `BUSY` | the radio remote currently owns the wheels |
-| 5 | `CLIFF` | **refused: the sensor saw a drop** |
-| 6 | `SENSOR_FAULT` | **refused: the cliff sensor is not reporting** |
-| 7 | `BAD_ARG` | argument out of range (0 steps, 400 degrees, …) |
-| 8 | `LINK_TIMEOUT` | **the robot stopped itself** — you went quiet while driving |
+### Sensors and housekeeping
 
-When you get `CLIFF` or `SENSOR_FAULT`, do not retry in a loop. Tell the
-user to pick the robot up, or that the sensor needs attention.
-
-`LINK_TIMEOUT` is the one error the robot raises about *you*: you stopped
-sending while it was driving, so it stopped and released the wheels. Start
-the keepalive again rather than reconnecting.
+| Id | Name |
+|---|---|
+| `0x19` | `read_sensor` |
+| `0x30` | `hello` |
+| `0x31` | `ping` |
+| `0x32` | `bye` |
 
 ---
 
-## 5. Talking to WALL-E
+## 5. Talking to the robot
 
-The robot has **no microphone**. It answers questions in text and speaks
-the answer out loud, but you type the question — the app, or the radio
-remote, or the USB serial console.
-
-### `ask` — a question, answered by Gemini and spoken
+### The whole voice pipeline
 
 ```
-app                                            robot
- |-- COMMAND ask (0x1A) ---------------------->|
+ phone microphone
+        │  Web Speech API (in the app, on the phone)
+        ▼
+   speech → text
+        │  COMMAND ask (0x1a)
+        │  TEXT    op=0x01 "what do you see?"      ──TCP──▶ robot
+        │                                                │ wheels stop
+        │                                                │ Gemini (with the persona's prompt)
+        │                                                │ TTS → I²S → amplifier
+        │◀── TEXT op=0x03 "I see a table, friend! Friend!" ─┘
+        ▼
+   transcript in the app        sound from the ROBOT's own speaker
+```
+
+**The robot has no microphone and does no speech recognition.** That is a
+deliberate division of labour:
+
+| | In the app | In the firmware |
+|---|---|---|
+| Speech recognition | ✔ browser API, free, on a CPU with a proper OS | ✘ would need an I²S capture buffer competing with the TTS ring for RAM, plus a recogniser |
+| Microphone permission | the OS prompt the user understands | — |
+| Language selection | a picker | — |
+| AI + TTS | ✘ needs the Gemini key on the phone | ✔ key stays in one place |
+
+The robot only ever handles **text**. It answers in text *and* speaks, and
+the answer comes back as a `TEXT` frame with `op = 0x03` for the app's
+transcript.
+
+### `ask` — a question, answered and spoken
+
+```
+app                                              robot
+ |-- COMMAND ask (0x1a) -------------------------->|
  |-- TEXT  op=0x01 "what is the capital of..." ->|
  |                                             |  stop the wheels
  |                                             |  Gemini
- |                                             |  TTS -> amplifier
+ |                                             |  TTS → amplifier
  |<-- STATE THINKING --------------------------|
  |<-- TEXT  op=0x03 "I think it's Moscow..." <-|
  |<-- STATE SPEAKING --------------------------|
@@ -255,19 +241,70 @@ app                                            robot
 
 ### `speak` — say exactly this, no Gemini
 
-Same shape, but `op=0x02` and the robot uses TTS only. Useful for
-testing the audio path, and for app-driven messages like "battery low".
+Same shape with `op=0x02`. Useful for app-driven messages.
 
 ### `talk` / `joke` — no text frame needed
 
 `0x15` and `0x16` are one frame each: the robot decides *what* to say.
-`talk` gives a general line, `joke` gives a joke. Both are still spoken
-out loud.
 
 > While the robot is `THINKING` or `SPEAKING` the wheels are blocked for
-> **every** controller. A `move_forward` sent during that window is
-> refused with `BUSY`. This is intentional: a robot that rolls around
-> while it is talking cannot be heard and cannot be stopped.
+> **every** source. A `move_forward` sent in that window is refused with
+> `BUSY`. This is intentional: a robot that rolls around while it is talking
+> cannot be heard and cannot be stopped by the person listening to it.
+
+### The persona — `set_persona` + text op `0x04`
+
+**The app decides who the robot is.** On every connect it sends the persona
+before the first question, so a demo can change the robot's personality
+without reflashing anything.
+
+```
+app                                              robot
+ |-- COMMAND set_persona (0x1d) ----------------->|
+ |-- TEXT   op=0x04  {"n":"Vulkan",...} --------->|  parses
+ |<-- ACK   cmd = 0x1d ----------------------------|  or ERROR / BAD_ARG
+```
+
+The payload is compact JSON with single-letter keys, because a text frame is
+**240 bytes** and that is the whole budget:
+
+```json
+{"n":"Vulkan","s":"Friend!","m":"happy","p":"You are Vulkan, ..."}
+```
+
+| Key | Buffer | Required | Meaning |
+|---|---|---|---|
+| `n` | 24 | **yes** | the robot's name |
+| `s` | 24 | no (may be `""`) | suffix appended to every reply before it is spoken |
+| `m` | 16 | no (may be `""`) | mood, informational |
+| `p` | 216 | **yes** | the Gemini **system instruction** |
+
+Rules the firmware follows:
+
+1. `p` **replaces** the compiled-in system instruction, so every answer is
+   generated in that voice.
+2. `s` is appended to the answer — but **only if Gemini did not already end
+   with it** (case-insensitively). The prompt tells Gemini to add it, so it
+   usually does, and the firmware does not want "Friend! Friend!".
+3. **All or nothing.** A missing key, or a field longer than its buffer, is
+   refused with `BAD_ARG` and the *previous* persona is left completely
+   untouched. Partially applying one would give a robot whose name and whose
+   voice disagree — impossible to debug from outside.
+4. `set_persona` is the **only** command acknowledged *after* its text frame,
+   because the fixed packet carries no payload and the ack has to wait until
+   the words have been parsed. Do not treat an ack for `0x1d` as proof unless
+   it arrives after the frame.
+
+**The size budget is tight and worth respecting.** `{"n":"","s":"","m":"","p":""}`
+costs 27 bytes, so the longest prompt the protocol can carry at all is
+`240 − 27 − 1 = 212` bytes. The app's current prompt is 156, leaving 51 bytes
+of slack. Spelling the keys out (`{"name":"Vulkan",...}`) costs about 20
+bytes — on a payload this size that is the difference between a usable
+prompt and no persona at all.
+
+If the app never sends a persona, the firmware falls back to the compiled-in
+default (`PERSONA_DEFAULT_NAME` and `GEMINI_SYSTEM_PROMPT` in
+`robot_s3/include/config.h`), so the robot is never voiceless.
 
 ---
 
@@ -276,20 +313,25 @@ out loud.
 ```
 app                                    robot
 CONNECT ─────────────────────────────▶
-HELLO (0x30) ───────────────────────▶
                               ◀───── WELCOME, value = 1 (IDLE)
-SENSOR (0x19) ───────────────────▶
-                              ◀───── SENSOR, value = 1 (ground), arg = 12
+                              ◀───── REMOTE_STATE 0 (there is no radio remote)
+                              ◀───── SENSOR, ground, e.g. 12 cm
+HELLO (0x30) ───────────────────────▶
+                              ◀───── ACK, cmd = 0x30
+SET_PERSONA (0x1d) ──────────────────▶
+TEXT op=0x04 {"n":"Vulkan",...} ────▶
+                              ◀───── ACK, cmd = 0x1d        (or ERROR BAD_ARG)
+READ_SENSOR (0x19) ─────────────────▶
+                              ◀───── SENSOR, value = 1, arg = 12
 MOVE_STEPS (0x17, arg = 4) ───────▶
                               ◀───── ACK, cmd = 0x17
-                              ◀───── ROBOT_STATE, value = 6 (MOVING)
-                              ◀───── ROBOT_STATE, value = 1 (IDLE)     <- it finished
+                              ◀───── ROBOT_STATE 6 (MOVING)
+                              ◀───── ROBOT_STATE 1 (IDLE)     ← it finished
 MOVE_FORWARD (0x01, HELD) ───────▶        pressed
 MOVE_FORWARD (0x01, HELD) ───────▶        every 250 ms
-MOVE_FORWARD (0x01, HELD) ───────▶
 STOP (0x07) ─────────────────────▶        released
                               ◀───── ACK, cmd = 0x07
-                              ◀───── ROBOT_STATE, value = 1
+                              ◀───── ROBOT_STATE 1
 ```
 
 ---
@@ -297,11 +339,10 @@ STOP (0x07) ─────────────────────▶  
 ## 7. Reference implementation (TypeScript)
 
 ```ts
-// ---- constants mirrored from shared/walle_protocol.h -----------------
 const MAGIC = 0xa5, VERSION = 0x01;
 const PKT = 10, TEXT_HEADER = 8, TEXT_MAX = 240;
 
-export const TYPE_COMMAND = 0x01, TYPE_STATUS = 0x02, TYPE_TEXT = 0x03;
+export const TYPE = { COMMAND: 1, STATUS: 2, TEXT: 3 } as const;
 
 export const CMD = {
   MOVE_FORWARD: 0x01, MOVE_BACKWARD: 0x02,
@@ -313,15 +354,17 @@ export const CMD = {
   TALK: 0x15, JOKE: 0x16,
   MOVE_STEPS: 0x17, TURN_AROUND: 0x18,
   READ_SENSOR: 0x19,
-  ASK: 0x1a, SPEAK: 0x1b,
-  TURN_DEGREES: 0x1c,
+  ASK: 0x1a, SPEAK: 0x1b, TURN_DEGREES: 0x1c,
+  SET_PERSONA: 0x1d,
   EXPR_HAPPY: 0x20, EXPR_THINKING: 0x21, EXPR_SURPRISED: 0x22,
   EXPR_CONFUSED: 0x23, EXPR_IDLE: 0x24,
   HELLO: 0x30, PING: 0x31, BYE: 0x32,
 } as const;
 
-export const CLIFF = {
-  UNKNOWN: 0, GROUND: 1, WARN: 2, DROP: 3, FAULT: 4,
+export const ST = {
+  WELCOME: 0x80, ACK: 0x81, ERROR: 0x82, ROBOT_STATE: 0x83,
+  REMOTE_STATE: 0x84, BATTERY: 0x85, PONG: 0x86,
+  SENSOR: 0x87, CLIFF: 0x88,
 } as const;
 
 export const ERR = {
@@ -329,169 +372,276 @@ export const ERR = {
   BUSY: 4, CLIFF: 5, SENSOR_FAULT: 6, BAD_ARG: 7, LINK_TIMEOUT: 8,
 } as const;
 
+export const CLIFF = {
+  UNKNOWN: 0, GROUND: 1, WARN: 2, DROP: 3, FAULT: 4,
+} as const;
+
 export const ROBOT_STATE = [
   "boot", "idle", "thinking", "speaking", "exploring",
-  "observing", "moving", "dancing", "remote", "offline",
-] as const;
+  "observing", "moving", "dancing", "manual", "offline",
+] as const;                    // note: 8 is "manual", not "remote"
 
 const FLAG_HELD = 0x01;
-const PING_INTERVAL_MS = 300;
-
-// ---- client ---------------------------------------------------------
-export interface StatusEvents {
-  onStatus?: (cmd: number, value: number, arg: number, seq: number) => void;
-  onState?: (state: number, name: string) => void;
-  onCliff?: (state: number, groundCm: number) => void;
-  onError?: (code: number) => void;
-  onText?: (text: string) => void;
-}
+const PING_MS = 300;
+const HELD_REPEAT_MS = 250;
 
 export class WalleClient {
-  private buf = new Uint8Array(TEXT_HEADER + TEXT_MAX + PKT);
+  private buf = new Uint8Array(TEXT_HEADER + TEXT_MAX);
   private rxLen = 0;
   private rxWant = PKT;
+  private expectingText = false;
   private seq = 0;
-  private ping?: ReturnType<typeof setInterval>;
-  /** Set true while a direction button is held, to auto-ping. */
-  driving = false;
+  private keepalive?: ReturnType<typeof setInterval>;
+  private held: number | null = null;
 
   constructor(
-    private host: string,
-    private port = 8080,
-    private ev: StatusEvents = {},
+    private io: { write(b: Uint8Array): void },   // WallETcp plugin or a socket
+    private ev: {
+      onStatus?(cmd: number, value: number, arg: number): void;
+      onState?(state: number, name: string): void;
+      onCliff?(state: number, groundCm: number): void;
+      onError?(code: number): void;
+      onText?(kind: "ask" | "speak" | "reply", text: string): void;
+    } = {},
   ) {}
 
-  async connect(): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      const sock = new WebSocket(`ws://${this.host}:${this.port}`);
-      // NOTE: a browser WebSocket cannot open a raw TCP socket, so a
-      // browser app needs a tiny bridge or a native shell. A phone app,
-      // a desktop app, Node or Python can use a raw socket directly.
-      (sock as any).addEventListener("open", () => resolve());
-      (sock as any).addEventListener("error", reject);
-      (sock as any).addEventListener("message", (m: any) =>
-        this.feed(new Uint8Array(m.data)));
-    });
+  // ---- opening ----
+  open(): void {
     this.hello();
-    this.ping = setInterval(() => {
-      if (this.driving) this.send(CMD.PING);
-    }, PING_INTERVAL_MS);
+    this.setPersona({ n: "Vulkan", s: "Friend!", m: "happy",
+                      p: "You are Vulkan, ... End every reply with Friend!." });
+    this.readSensor();
+    this.keepalive = setInterval(() => {
+      // Ping only when NOT driving: a held command is its own keepalive.
+      if (this.held === null) this.ping();
+    }, PING_MS);
   }
 
-  close() {
-    if (this.ping) clearInterval(this.ping);
-    this.send(CMD.BYE);
+  close(): void {
+    if (this.keepalive) clearInterval(this.keepalive);
+    this.bye();
   }
 
-  /** One 10-byte command. */
-  send(cmd: number, arg = 0, value = 0, held = false): void {
+  // ---- outbound ----
+  send(cmd: number, arg = 0, held = false, value = 0): void {
     const b = new Uint8Array(PKT);
     const v = new DataView(b.buffer);
-    v.setUint8(0, MAGIC);      v.setUint8(1, VERSION);
-    v.setUint8(2, TYPE_COMMAND); v.setUint8(3, cmd);
-    v.setUint8(4, value);      v.setUint8(5, (this.seq = (this.seq + 1) & 0xff));
+    v.setUint8(0, MAGIC);        v.setUint8(1, VERSION);
+    v.setUint8(2, TYPE.COMMAND); v.setUint8(3, cmd);
+    v.setUint8(4, value);        v.setUint8(5, (this.seq = (this.seq + 1) & 0xff));
     v.setUint8(6, held ? FLAG_HELD : 0);
     v.setUint8(7, 0);
     v.setUint16(8, arg, true);   // little endian
-    this.raw(b);
+    this.io.write(b);
   }
 
-  /** A TEXT frame: announce with ask/speak, then send the words. */
   private sendText(op: number, text: string): void {
-    const bytes = new TextEncoder().encode(text).slice(0, TEXT_MAX);
+    // Truncate on a CHARACTER boundary, never a byte boundary.
+    const enc = new TextEncoder();
+    let bytes = enc.encode(text);
+    if (bytes.length > TEXT_MAX) {
+      let s = text;
+      while (enc.encode(s).length > TEXT_MAX) s = s.slice(0, -1);
+      bytes = enc.encode(s);
+    }
     const b = new Uint8Array(TEXT_HEADER + bytes.length);
     const v = new DataView(b.buffer);
-    v.setUint8(0, MAGIC);      v.setUint8(1, VERSION);
-    v.setUint8(2, TYPE_TEXT); v.setUint8(3, op);
+    v.setUint8(0, MAGIC);       v.setUint8(1, VERSION);
+    v.setUint8(2, TYPE.TEXT);   v.setUint8(3, op);
     v.setUint8(4, 0);
     v.setUint16(5, bytes.length, true);
-    v.setUint8(7, 0);
     b.set(bytes, TEXT_HEADER);
-    this.raw(b);
+    this.io.write(b);
   }
 
-  ask(question: string)   { this.send(CMD.ASK);   this.sendText(0x01, question); }
-  speakExactly(text: string) { this.send(CMD.SPEAK); this.sendText(0x02, text); }
+  hello()        { this.send(CMD.HELLO); }
+  ping()         { this.send(CMD.PING); }
+  bye()          { this.send(CMD.BYE); }
+  readSensor()   { this.send(CMD.READ_SENSOR); }
+  moveSteps(n: number)       { this.send(CMD.MOVE_STEPS, n); }
+  turnDegrees(d: number)     { this.send(CMD.TURN_DEGREES, d); }
+  turnAround()              { this.send(CMD.TURN_AROUND); }
+  stop() { this.held = null; this.send(CMD.STOP); }
 
-  hello()   { this.send(CMD.HELLO); }
-  forward(held: boolean) { this.driving = held; this.send(CMD.MOVE_FORWARD, 0, 0, held); }
-  stop()    { this.driving = false; this.send(CMD.STOP); }
-  steps(n: number)       { this.send(CMD.MOVE_STEPS, n); }
-  turnAround()           { this.send(CMD.TURN_AROUND); }
-  turnDegrees(d: number) { this.send(CMD.TURN_DEGREES, d); }
-  readSensor()           { this.send(CMD.READ_SENSOR); }
+  drive(cmd: number, down: boolean): void {
+    if (down) {
+      this.held = cmd;
+      this.send(cmd, 0, true);
+      this.heldTimer = setInterval(() => this.send(cmd, 0, true), HELD_REPEAT_MS);
+    } else {
+      if (this.heldTimer) clearInterval(this.heldTimer);
+      this.heldTimer = undefined;
+      this.held = null;
+      this.send(CMD.STOP);
+    }
+  }
+  private heldTimer?: ReturnType<typeof setInterval>;
+
+  ask(text: string) {
+    this.send(CMD.ASK);
+    this.sendText(0x01, text);
+  }
+  speakExactly(text: string) {
+    this.send(CMD.SPEAK);
+    this.sendText(0x02, text);
+  }
+  setPersona(p: { n: string; s?: string; m?: string; p: string }) {
+    const payload = JSON.stringify({
+      n: p.n, s: p.s ?? "", m: p.m ?? "", p: p.p,
+    });                      // short keys: the budget is 240 bytes TOTAL
+    this.send(CMD.SET_PERSONA);
+    this.sendText(0x04, payload);
+  }
 
   // ---- inbound ----
-  private raw(b: Uint8Array) { /* socket.send(b) */ }
-
-  private feed(chunk: Uint8Array) {
+  feed(chunk: Uint8Array): void {
     for (const byte of chunk) {
       if (this.rxLen === 0) {
-        if (byte !== MAGIC) continue;         // resync on the magic byte
+        if (byte !== MAGIC) continue;                 // resync
         this.buf[this.rxLen++] = byte;
         this.rxWant = PKT;
         continue;
       }
+      if (this.rxLen === 1 && byte !== VERSION) { this.reset(); continue; }
+      if (this.rxLen >= this.buf.length) { this.reset(); continue; }
+
       this.buf[this.rxLen++] = byte;
 
-      if (this.rxWant === PKT) {
-        if (this.rxLen >= PKT) { this.onPacket(); this.rxLen = 0; }
-        continue;
+      // The TYPE byte decides fixed vs text. Never the length.
+      if (this.rxLen === 3) {
+        this.expectingText = this.buf[2] === TYPE.TEXT;
+        this.rxWant = this.expectingText ? TEXT_HEADER : PKT;
       }
-      if (this.rxLen === TEXT_HEADER) {
-        const v = new DataView(this.buf.buffer);
-        this.rxWant = TEXT_HEADER + v.getUint16(5, true);
+      if (this.expectingText && this.rxLen === TEXT_HEADER) {
+        const len = new DataView(this.buf.buffer).getUint16(5, true);
+        if (len === 0 || len > TEXT_MAX) { this.reset(); continue; }
+        this.rxWant = TEXT_HEADER + len;
       }
-      if (this.rxLen >= this.rxWant) { this.onText(); this.rxLen = 0; }
+      if (this.rxLen < this.rxWant) continue;
+
+      if (this.expectingText) this.onText(); else this.onPacket();
+      this.reset();
     }
   }
 
-  private onPacket() {
+  private reset(): void {
+    this.rxLen = 0;
+    this.rxWant = PKT;
+    this.expectingText = false;
+  }
+
+  private onPacket(): void {
     const v = new DataView(this.buf.buffer);
     if (v.getUint8(0) !== MAGIC || v.getUint8(1) !== VERSION) return;
-    const type = v.getUint8(2), cmd = v.getUint8(3);
-    const value = v.getUint8(4), seq = v.getUint8(5);
-    const arg = v.getUint16(8, true);
-    if (type !== TYPE_STATUS) return;
+    if (v.getUint8(2) !== TYPE.STATUS) return;
 
-    this.ev.onStatus?.(cmd, value, arg, seq);
+    const cmd = v.getUint8(3), value = v.getUint8(4);
+    const arg = v.getUint16(8, true);
+    this.ev.onStatus?.(cmd, value, arg);
 
     switch (cmd) {
-      case 0x80: case 0x83: case 0x86:            // WELCOME / STATE / PONG
+      case ST.WELCOME:
+      case ST.ROBOT_STATE:
+      case ST.PONG:
         this.ev.onState?.(value, ROBOT_STATE[value] ?? "?"); break;
-      case 0x82: this.ev.onError?.(value); break;
-      case 0x87: case 0x88:                       // SENSOR / CLIFF
+      case ST.ERROR:
+        this.ev.onError?.(value); break;
+      case ST.SENSOR:
+      case ST.CLIFF:
         this.ev.onCliff?.(value, arg); break;
     }
   }
 
-  private onText() {
+  private onText(): void {
     const op = this.buf[3];
-    const len = this.rxWant - TEXT_HEADER;
-    if (op !== 0x03) return;                     // only replies matter
-    this.ev.onText?.(new TextDecoder().decode(this.buf.slice(TEXT_HEADER, TEXT_HEADER + len)));
+    const text = new TextDecoder().decode(
+      this.buf.slice(TEXT_HEADER, this.rxWant));
+    const kind = op === 0x03 ? "reply" : op === 0x02 ? "speak" : "ask";
+    this.ev.onText?.(kind, text);
   }
 }
 ```
 
-### Python smoke test (no app required)
+### Speech recognition in the app
 
-This proves the robot is reachable and the framing is right, before you
-write a single line of app code.
+The app uses the Web Speech API, which works inside the Android WebView:
+
+```ts
+const SR = globalThis.SpeechRecognition ?? (globalThis as any).webkitSpeechRecognition;
+
+async function listen(timeoutMs = 7000): Promise<string | null> {
+  const SRc = SR;
+  if (!SRc || !navigator.mediaDevices?.getUserMedia) return null;   // no mic
+
+  return new Promise((resolve) => {
+    const rec = new SRc();
+    rec.continuous = false;
+    rec.interimResults = true;      // show the user it is hearing them
+    rec.lang = "en-US";
+    rec.maxAlternatives = 1;
+
+    let settled = false;
+    const done = (v: string | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
+
+    rec.onresult = (e) => {
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        if (r.isFinal) return done((r[0] as SpeechRecognitionResult).transcript.trim());
+      }
+    };
+    rec.onerror = () => done(null);
+    rec.onend   = () => done(null);
+
+    const timer = setTimeout(() => { try { rec.stop(); } catch {} done(null); },
+                            timeoutMs);
+    rec.start();
+  });
+}
+
+// …then send it. The robot does the thinking.
+const text = await listen();
+if (text) client.ask(text);
+```
+
+Three details worth keeping:
+
+* **Always send a timeout.** A recognition session that never fires leaves
+  the button stuck "listening" for ever.
+* **Always send a `stop()`.** A cancelled session can end without a result.
+* **Handle `not-allowed`.** That is the user denying microphone permission,
+  and it needs different wording from "I didn't hear anything".
+
+### Python smoke test
+
+Proves the robot is reachable and the framing is right, before you touch the
+app.
 
 ```python
 import socket, struct, time
 
-HOST, PORT = "192.168.1.42", 8080   # <- the robot's IP from its serial log
+HOST, PORT = "192.168.1.42", 8080     # the robot's IP from its serial log
 
 def packet(cmd, arg=0, value=0, flags=0, seq=0):
     # magic, version, type, cmd, value, seq, flags, reserved, arg(u16 LE)
     return struct.pack("<BBBBBBBB H", 0xA5, 0x01, 0x01, cmd, value, seq, flags, 0, arg)
 
+def text(op, payload: str):
+    b = payload.encode()
+    return struct.pack("<BBBBBBH B", 0xA5, 0x01, 0x03, op, 0, len(b), 0, 0) + b
+
 s = socket.create_connection((HOST, PORT), timeout=5)
-s.sendall(packet(0x30))                      # HELLO
+s.sendall(packet(0x30))                                  # HELLO
 time.sleep(0.3)
-s.sendall(packet(0x19))                      # READ_SENSOR
+s.sendall(packet(0x1d) + text(0x04,                      # SET_PERSONA
+    '{"n":"Pinocchio","s":"Buon giorno!","m":"happy",'
+    '"p":"You are Pinocchio, a cheerful little robot."}'))
+time.sleep(0.3)
+s.sendall(packet(0x19))                                  # READ_SENSOR
 time.sleep(0.5)
 
 s.settimeout(2)
@@ -505,93 +655,153 @@ except socket.timeout:
     pass
 ```
 
-Expected in the hex dump: a `WELCOME` (`a5 01 02 80 ...`), then
-`SENSOR` (`a5 01 02 87 <value> ... <arg LE>`).
+Expect a `WELCOME` (`a5 01 02 80 …`), an `ACK` for `0x1d` (`a5 01 02 81 1d …`),
+then a `SENSOR` (`a5 01 02 87 <value> … <arg LE>`).
 
-### Driving the robot from Python
+### Driving it from Python
 
 ```python
-import time
-s.sendall(packet(0x17, arg=4))               # 4 steps, stops by itself
+s.sendall(packet(0x17, arg=4))     # 4 steps, stops by itself
 time.sleep(1.5)
-s.sendall(packet(0x07))                      # stop (always safe to send)
+s.sendall(packet(0x07))            # stop (always safe to send)
 ```
 
 ---
 
-## 8. What the app cannot do (yet)
+## 8. Status (robot → app)
 
-Being explicit about this saves a lot of confusion:
+| Id | Name | Carries |
+|---|---|---|
+| `0x80` | `WELCOME` | `value` = robot state, on connect and after `hello` |
+| `0x81` | `ACK` | `cmd` = the command that ran |
+| `0x82` | `ERROR` | `value` = error code |
+| `0x83` | `ROBOT_STATE` | `value` = robot state |
+| `0x84` | `REMOTE_STATE` | always `0` — the radio remote has been removed |
+| `0x85` | `BATTERY` | never sent; no sensor feeds it |
+| `0x86` | `PONG` | `value` = robot state |
+| `0x87` | `SENSOR` | `value` = cliff state, `arg` = ground distance in **cm** |
+| `0x88` | `CLIFF` | `value` = cliff state, on the transition |
 
-* **The robot cannot listen.** There is no microphone and no
-  speech-to-text on the robot. Speech input lives in the radio remote or
-  the app itself, never in the firmware.
-* **No distance reporting on every change.** The robot pushes `SENSOR`
-  on `read_sensor`, on cliff transitions and about once a second. If you
-  want a smooth live graph, poll with `read_sensor` at ~5 Hz — that is
-  a real ultrasonic echo per poll, so do not poll faster.
-* **No battery.** `WALLE_ST_BATTERY` exists in the protocol but no
-  voltage sensor feeds it, so it is never sent. Do not build a battery
-  gauge against it.
-* **No camera stream.** The camera is compiled out on a plain ESP32-S3.
-* **No audio to the app.** The robot streams TTS straight to its own
-  amplifier; it does not send audio back.
+WALL-E's spoken answer is **not** a status packet — it arrives as a `TEXT`
+frame with `op = 0x03`.
+
+### Robot states
+
+| # | Name | |
+|---|---|---|
+| 0 | `boot` | starting up |
+| 1 | `idle` | awake |
+| 2 | `thinking` | **wheels blocked** |
+| 3 | `speaking` | **wheels blocked** |
+| 4 | `exploring` | driving itself |
+| 5 | `observing` | paused, looking around |
+| 6 | `moving` | mid-manoeuvre |
+| 7 | `dancing` | |
+| 8 | `manual` | a controller owns the wheels |
+| 9 | `offline` | no Wi-Fi, AI paused |
+
+`8` used to mean `remote`. It now means "the app is driving" — the value did
+not change, because it is on the wire.
+
+### Cliff states
+
+| # | Name | |
+|---|---|---|
+| 0 | `unknown` | not configured, or no reading yet |
+| 1 | `ground` | safe |
+| 2 | `warn` | near the edge, driving slowly |
+| 3 | `drop` | **no floor — stopped** |
+| 4 | `fault` | **sensor not responding — stopped** |
+
+`arg` is the vertical distance to the floor in cm. This is the difference
+between "the robot is stuck" and "the robot correctly refused to walk off the
+table", so show it prominently.
+
+### Errors
+
+| # | Name | What the app should show |
+|---|---|---|
+| 1 | `BAD_PACKET` | Bad packet from the robot — check the connection |
+| 2 | `UNKNOWN_CMD` | WALL-E did not recognise that command |
+| 3 | `NOT_CONFIGURED` | That feature is not wired up on this robot |
+| 4 | `BUSY` | The wheels are blocked or someone else has control |
+| 5 | `CLIFF` | WALL-E stopped at the edge — pick it up or move it back |
+| 6 | `SENSOR_FAULT` | WALL-E's distance sensor is not responding |
+| 7 | `BAD_ARG` | That value was out of range (or a persona was malformed) |
+| 8 | `LINK_TIMEOUT` | WALL-E stopped driving because the app went quiet |
+
+`CLIFF` and `SENSOR_FAULT` are **not retried** — they are stop conditions.
 
 ---
 
-## 9. Prompt for the CLI building the app
+## 9. Priority and safety
+
+Above the dispatcher's priority table, **safety wins**: every motion command
+is offered to the safety guard first. A cliff, a dead sensor, or a
+conversation in progress refuses the command, whatever asked for it.
+
+- `STOP`, `BYE` and `IDLE` from any source always run.
+- Exactly one source owns the wheels at a time.
+- While `thinking` or `speaking`, movement is refused with `BUSY`.
+
+Surface all of this rather than fighting it: grey out the joystick and say
+why.
+
+---
+
+## 10. What the app cannot do, and why
+
+| Missing | Reason |
+|---|---|
+| Audio playback | the robot streams TTS to its own amplifier; it sends no audio back |
+| Camera view | the camera is compiled out on the ESP32-S3 |
+| Battery gauge | `BATTERY` exists in the protocol but no sensor feeds it. Hide the row until a real reading arrives. |
+| Discovery | no mDNS in the firmware; ask for the IP |
+| Real distances | no wheel encoders. "4 steps" is a timed estimate from `STEP_DISTANCE_CM`, not a measurement. |
+| Robot-side listening | the robot has no microphone, by design — see §5 |
+
+---
+
+## 11. Prompt for a CLI modifying the app
 
 > Copy everything below this line as your instructions.
 
----
+You are modifying the **companion app for WALL-E**, a small ESP32-S3 robot.
+The robot's firmware is **already written and compiled**; your job is the app
+side only. The contract is in `robot_s3/docs/APP_INTEGRATION.md` — read it
+first and follow it exactly. Do not invent protocol details.
 
-You are implementing the **companion app for WALL-E**, a small ESP32-S3
-robot. The robot's firmware is **already written and compiled**. Your job
-is **only** the app side. You must not invent protocol details: the
-contract is in `robot_s3/docs/APP_INTEGRATION.md`, read it first and
-follow it exactly.
+**Transport.** A raw TCP socket to the robot's IP on port `8080`. Not HTTP,
+not WebSocket, not JSON. On Android use the existing `WallETcp` Capacitor
+plugin, which sends and receives base64 byte chunks. Keep all framing in
+TypeScript, not in the plugin, so there is exactly one copy of it.
 
-**1. Transport.** A raw TCP socket to the robot's IP on port `8080`. Not
-HTTP, not WebSocket, not JSON. If your target platform is a browser,
-say so up front and stop — a browser cannot open a raw TCP socket and
-you will need a bridge. For Node, Python, React Native, Swift, Kotlin or
-a desktop app, use a plain socket.
+**Framing.** Binary, little endian. Use `DataView`. Determine frame type from
+the **type byte at offset 2**, never from the length — a 10-byte text frame is
+indistinguishable from a fixed packet by size alone.
 
-**2. Wire format.** Binary, little-endian, 10-byte command packets.
-Implement `WallePacket` exactly as in the reference TypeScript above.
-Use `DataView`; never pack a language struct, because padding differs.
+**Keep these exact behaviours.** They exist for a safety reason, not a
+stylistic one:
 
-**3. Implement these, in this priority order:**
-   a. Connect, send `HELLO`, render the robot state.
-   b. Direction buttons. On press send the command with `HELD`; on
-      release send `STOP`. **Re-send the held command every 250 ms** or
-      the robot stops after 700 ms of silence.
-   c. Stop button, always available, never disabled.
-   d. Mode buttons: dance, explore, autonomous on/off, expressions.
-   e. `read_sensor` and a small live readout of the cliff state and
-      ground distance, plus a clear warning when the state is `DROP` or
-      `FAULT`.
-   f. A text box that sends `ask` + a TEXT frame, and displays the
-      `WALLE_OP_REPLY` text frame.
-   g. The timed motions: "4 steps" and "turn around". Note that these
-      finish on their own — do not add a keepalive loop for them, and do
-      not expect a `stop` to be needed.
+1. Re-send a held direction every **250 ms** with `FLAG_HELD`; send `STOP` on
+   release. The robot stops itself after 700 ms of silence.
+2. Send `PING` every 300 ms when connected but idle.
+3. Hold a **screen wake lock** while visible. A locked screen means a silent
+   app means a stopped robot.
+4. On `ERROR` / `LINK_TIMEOUT`, treat it as a notice — the link is up, just
+   restart the keepalive. Do not reconnect.
+5. Never retry `CLIFF` or `SENSOR_FAULT`. They are stop conditions.
+6. Truncate text at 240 bytes **on a character boundary**.
+7. Build the persona payload with **single-letter keys**. The budget is 240
+   bytes total and the current prompt is already 156.
+8. Send the persona on **every** connect, before `hello` completes.
 
-**4. Error handling is not optional.** The robot answers every command
-with `ACK` or `ERROR`, and it refuses commands when it cannot or must
-not comply. Map each error to a message a person can act on:
-   * `CLIFF` → "Wall-E stopped at the edge — pick it up or move it back"
-   * `SENSOR_FAULT` → "Wall-E's distance sensor is not responding"
-   * `BUSY` → "The handheld remote has control" (or "WALL-E is talking")
-   * `NOT_CONFIGURED` → "That feature isn't wired up on this robot"
-   * `BAD_ARG` → a bug in your call; clamp before sending.
-   Never retry a refused movement command in a loop.
+**Speech recognition.** Keep using the Web Speech API. Always set a timeout,
+always `stop()` the session, and distinguish "permission denied" from
+"didn't hear anything". Send the transcript with `ask` + text op `0x01`. Do
+**not** add a text-to-speech of your own — the robot's own speaker is the
+thing a live demo is meant to show.
 
-**5. Do not paper over the safety rules.** The robot will refuse to move
-while it is thinking or speaking, and while the cliff sensor is unhappy.
-That is intended. Surface it in the UI instead of fighting it.
-
-**6. Deliverables.** A typed client module matching the reference
-implementation, a small UI exercising points 3a–3g, and a README saying
-how to find the robot's IP address (it is printed on the robot's serial
-log at boot) and how to run it.
+**Deliverables.** Whatever you change, state plainly: (a) which commands you
+use, (b) how the 700 ms watchdog is satisfied, (c) how you surface each error
+code, and (d) what you did **not** implement.

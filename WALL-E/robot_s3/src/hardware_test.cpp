@@ -20,7 +20,6 @@
 #include "gemini_client.h"
 #include "camera_manager.h"
 #include "wifi_manager.h"
-#include "remote_link.h"
 #include "robot_state.h"
 #include "behavior.h"
 #include "dance.h"
@@ -28,6 +27,7 @@
 #include "audio_output.h"
 #include "cliff_sensor.h"
 #include "maneuver.h"
+#include "persona.h"
 #include "safety.h"
 #include "app_link.h"
 #include <math.h>
@@ -334,13 +334,71 @@ static void testManeuver() {
 }
 
 // ------------------------------------------------------------
-//  13. APP LINK
+// ------------------------------------------------------------
+//  11. PERSONA
+//  The app decides who the robot is. This exercises the exact
+//  frames the app sends, so the voice pipeline can be proven
+//  without the phone: accept, refuse, and prove a refusal leaves
+//  the previous personality completely untouched.
+// ------------------------------------------------------------
+static void testPersona() {
+    Serial.println("[TEST] === PERSONA ===");
+    Serial.printf("[TEST] Compiled-in default : %s\n", persona.name());
+    Serial.printf("[TEST]   prompt: %s\n", persona.prompt());
+
+    const char* good =
+        "{\"n\":\"Pinocchio\",\"s\":\"Buon giorno!\",\"m\":\"happy\","
+        "\"p\":\"You are Pinocchio, a cheerful little robot for children. "
+        "Always reply. One or two short sentences.\"}";
+    const char* missingKey = "{\"n\":\"Nobody\",\"m\":\"happy\",\"p\":\"hi\"}";
+    const char* garbage     = "not json at all";
+
+    Serial.println();
+    Serial.println("[TEST] 1) a valid payload -> expect ACCEPTED");
+    commands.setPersona(good);
+    Serial.printf("[TEST]    name   = %s\n", persona.name());
+    Serial.printf("[TEST]    mood   = %s\n", persona.mood());
+    Serial.printf("[TEST]    suffix = \"%s\"\n", persona.suffix());
+    Serial.printf("[TEST]    prompt = %s\n", persona.prompt());
+
+    Serial.println();
+    Serial.println("[TEST] 2) missing the \"s\" key -> expect REFUSED");
+    commands.setPersona(missingKey);
+    Serial.printf("[TEST]    name = %s   (must still be Pinocchio)\n", persona.name());
+
+    Serial.println();
+    Serial.println("[TEST] 3) not JSON at all -> expect REFUSED");
+    commands.setPersona(garbage);
+    Serial.printf("[TEST]    name = %s   (must still be Pinocchio)\n", persona.name());
+
+    Serial.println();
+    Serial.println("[TEST] 4) the suffix is added only when it is missing:");
+    String a = "I am Pinocchio.";
+    persona.decorate(&a);
+    Serial.printf("[TEST]    plain       -> \"%s\"\n", a.c_str());
+    String b = "I am Pinocchio. buon giorno!";
+    persona.decorate(&b);
+    Serial.printf("[TEST]    already there -> \"%s\"   (must NOT double up)\n", b.c_str());
+
+    Serial.println();
+    Serial.println("[TEST] 5) restoring the compiled-in default");
+    persona.begin();
+    Serial.printf("[TEST]    name = %s\n", persona.name());
+
+    pressEnter("PERSONA");
+}
+
+// ------------------------------------------------------------
+//  12. APP LINK
 //  Prints the address to connect to and waits for a TCP client.
+//  There is no radio remote any more, so this is the only way to
+//  drive the robot from outside the firmware.
 // ------------------------------------------------------------
 static void testApp() {
     Serial.println("[TEST] === APP LINK (TCP) ===");
     Serial.printf("[TEST] Port: %d\n", APP_TCP_PORT);
     Serial.printf("[TEST] Link: %s\n", AppLink::nameOf(appLink.state()));
+    Serial.printf("[TEST] Persona: %s\n", persona.name());
 
     if (!wifi.connected()) {
         Serial.println("[TEST] Wi-Fi is DOWN, so the app cannot connect yet.");
@@ -351,36 +409,23 @@ static void testApp() {
         Serial.printf("[TEST]   nc %s %d\n",
                       WiFi.localIP().toString().c_str(), APP_TCP_PORT);
     }
-    Serial.println("[TEST] Waiting 20 s for the app...");
-    Serial.println("[TEST] Send 10 bytes starting with 0xA5 (see docs/APP_INTEGRATION.md).");
+    Serial.println("[TEST] Every frame starts with the magic byte 0xA5.");
+    Serial.println("[TEST] Byte layout: docs/APP_INTEGRATION.md");
+    Serial.println("[TEST] On connect the app sends HELLO, a persona, then a sensor read.");
 
+    Serial.println("[TEST] Waiting 20 s for the app...");
     const uint32_t start = millis();
     while (millis() - start < 20000) {
         appLink.update(millis());
         if (appLink.connected()) {
-            Serial.println("[TEST] App CONNECTED - try a command now.");
+            Serial.println("[TEST] App CONNECTED - drive it from the phone.");
         }
         delay(50);
     }
     Serial.printf("[TEST] Link: %s\n", AppLink::nameOf(appLink.state()));
+    Serial.printf("[TEST] Persona the app set: %s\n", persona.name());
     pressEnter("APP");
 }
-
-static void testRemote() {
-    Serial.println("[TEST] Waiting 15 s for a remote to press a button...");
-    Serial.println("[TEST] (the remote must be flashed and powered on)");
-    const uint32_t start = millis();
-    bool seen = false;
-    while (millis() - start < 15000) {
-        remoteLink.update(millis());
-        if (remoteLink.state() == REMOTE_CONNECTED) { seen = true; break; }
-        delay(20);
-    }
-    Serial.printf("[TEST] Remote link: %s\n", remoteLink.nameOf(remoteLink.state()));
-    if (!seen) Serial.println("[TEST] No remote heard. Check the channel matches and both are flashed.");
-    pressEnter("REMOTE");
-}
-
 // ------------------------------------------------------------
 void runHardwareTestMode() {
     // Bring up only what the tests need. The safety guard and the
@@ -403,15 +448,15 @@ void runHardwareTestMode() {
     Serial.println(" 1) OLED expressions        8) Gemini");
     Serial.println(" 2) Motor 1                 9) Speaker tone");
     Serial.println(" 3) Motor 2                10) TTS (speak a Gemini line)");
-    Serial.println(" 4) Motor 3                11) Wireless remote");
+    Serial.println(" 4) Motor 3                11) Persona (accept + refuse)");
     Serial.println(" 5) Motor 4                12) App link (TCP)");
     Serial.println(" 6) Camera                 13) Driver module (STBY + channels)");
     Serial.println(" 7) Wi-Fi                  14) Cliff sensor (HC-SR04)");
     Serial.println("                           15) Motion primitives / calibration");
     Serial.println(" 0) Exit (start the robot)");
     Serial.println("=============================================================");
-    Serial.println(" (there is no microphone test: the robot has no mic -");
-    Serial.println("  Speech-to-Text runs on the remote or the app instead)");
+    Serial.println(" (there is no microphone test: the robot has no mic - the");
+    Serial.println("  app does the speech recognition and sends the words as text)");
     Serial.println(" DO 14 FIRST: without a correct SENSOR_NOMINAL_GROUND_CM the");
     Serial.println(" robot will refuse to move at all.");
     Serial.println();
@@ -437,7 +482,7 @@ void runHardwareTestMode() {
             case 8: testGemini();   break;
             case 9: testSpeaker();  break;
             case 10: testTts();     break;
-            case 11: testRemote();  break;
+            case 11: testPersona(); break;
             case 12: testApp();     break;
             case 13: testDriver();  break;
             case 14: testCliff();   break;
@@ -454,8 +499,8 @@ void runHardwareTestMode() {
 void printConsoleHelp() {
     Serial.println();
     Serial.println("--- WALL-E console ---");
-    Serial.println("  Commands go through the same dispatcher as the");
-    Serial.println("  wireless remote, so priority rules are identical.");
+    Serial.println("  Commands go through the same dispatcher as the app,");
+    Serial.println("  so the priority rules are identical.");
     Serial.println();
     Serial.println("  fwd / back / left / right / rotl / rotr  - drive");
     Serial.println("  stop      - stop everything NOW (also resumes autonomy)");
@@ -472,6 +517,7 @@ void printConsoleHelp() {
     Serial.println("  say X     - send X to Gemini and show the reply on the OLED");
     Serial.println("  sensor    - one cliff reading, live");
     Serial.println("  watch     - continuous cliff readings + the safety verdict");
+    Serial.println("  whoami    - who the robot currently thinks it is");
     Serial.println("  status    - print system status");
     Serial.println("  help      - this list");
     Serial.println();
@@ -549,6 +595,22 @@ void pollSerialConsole() {
             LOGI(TAG, "Asking Gemini: %s", prompt.c_str());
         }
 
+        // ---- the persona ----
+        else if (line == "whoami") {
+            Serial.printf("  I am %s (%s), set by %s\n",
+                          persona.name(), persona.mood(),
+                          persona.fromApp() ? "the app"
+                                            : "the compiled-in default");
+            Serial.printf("  instruction: %s\n", persona.prompt());
+            Serial.printf("  every reply ends with: \"%s\"\n", persona.suffix());
+        }
+        else if (line.startsWith("persona ")) {
+            // Accepts the same compact JSON the app sends, so a
+            // personality can be changed from the console mid-demo.
+            commands.setPersona(line.substring(8).c_str());
+            Serial.printf("  I am now %s\n", persona.name());
+        }
+
         // ---- the cliff sensor ----
         else if (line == "sensor") {
             cliffSensor.pollNow();
@@ -591,12 +653,13 @@ void pollSerialConsole() {
                 cliffSensor.groundCm(),
                 SafetyGuard::reasonName(safety.blockReason()),
                 maneuver.busy() ? Maneuver::nameOf(maneuver.kind()) : "none");
-            Serial.printf("  remote=%s  owner=%s  autonomy=%s\n",
-                RemoteLink::nameOf(remoteLink.state()),
+            Serial.printf("  app=%s  owner=%s  autonomy=%s\n",
+                AppLink::nameOf(appLink.state()),
                 CommandDispatcher::sourceName(commands.owner()),
                 behavior.autonomous() ? "on" : "off");
-            Serial.printf("  app=%s  spk=%s  audio=%s  tts=%s\n",
-                AppLink::nameOf(appLink.state()),
+            Serial.printf("  persona=%s (%s)  spk=%s  audio=%s  tts=%s\n",
+                persona.name(),
+                persona.fromApp() ? "from app" : "built in",
                 speaker.ready() ? "ok" : "UNSET",
                 speaker.loaded() ? "loaded" : "unloaded (idle)",
                 tts.ready() ? "ok" : "no-key");

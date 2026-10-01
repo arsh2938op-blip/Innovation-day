@@ -5,6 +5,7 @@
 #include "app_link.h"
 #include "command_dispatch.h"
 #include "behavior.h"
+#include "cliff_sensor.h"
 #include "log.h"
 #include "motor_controller.h"
 #include "safety.h"
@@ -102,28 +103,25 @@ void AppLink::sendText(uint8_t op, const char* text) {
     if (!_client || !_client.connected() || !text) return;
 
     const size_t len = strlen(text);
-    if (len == 0 || len > WALLE_TEXT_MAX) {
-        LOGW(TAG, "reply too long (%u bytes), sending truncated", (unsigned)len);
+    if (len == 0) { LOGW(TAG, "Nothing to send in text op %u", op); return; }
+    if (len > WALLE_TEXT_MAX) {
+        LOGW(TAG, "Text too long (%u > %u), truncating",
+             (unsigned)len, (unsigned)WALLE_TEXT_MAX);
     }
     const uint16_t n = (uint16_t)(len > WALLE_TEXT_MAX ? WALLE_TEXT_MAX : len);
 
-    WalleTextHeader h;
-    h.magic    = WALLE_PROTO_MAGIC;
-    h.version  = WALLE_PROTO_VERSION;
-    h.type     = WALLE_MSG_TEXT;
-    h.op       = op;
-    h.flags    = 0;
-    h.len      = n;
-    h.reserved = 0;
+    // Built by the shared helper, so the length lands at offset 5 - the
+    // offset the app reads it from. Filling this struct in by hand is
+    // precisely how the offset-6 bug got in.
+    const WalleTextHeader h = walle_make_text_header(op, n);
 
     uint8_t frame[WALLE_PROTO_TEXT_HEADER + WALLE_TEXT_MAX];
-    memcpy(frame, &h, sizeof(h));
-    memcpy(frame + sizeof(h), text, n);
+    memcpy(frame, &h, WALLE_PROTO_TEXT_HEADER);        // exactly 8 bytes
+    memcpy(frame + WALLE_PROTO_TEXT_HEADER, text, n);
 
-    writeRaw(frame, sizeof(h) + n);
-    LOGI(TAG, "Sent reply (%u bytes)", (unsigned)n);
+    writeRaw(frame, WALLE_PROTO_TEXT_HEADER + n);
+    LOGI(TAG, "Sent %s (%u bytes)", walle_text_op_name(op), (unsigned)n);
 }
-
 // ------------------------------------------------------------
 //  Inbound
 // ------------------------------------------------------------
@@ -169,6 +167,12 @@ void AppLink::handleTextFrame(uint8_t op, const char* text) {
             behavior.requestSpeak(String(text));
             break;
         }
+        case WALLE_OP_PERSONA: {
+            // The only place a SET_PERSONA can be acked: the words are
+            // here now, so the outcome is known.
+            commands.setPersona(text);
+            break;
+        }
         default:
             LOGW(TAG, "unknown text op %u", op);
             sendError(WALLE_ERR_UNKNOWN_CMD);
@@ -198,8 +202,12 @@ void AppLink::update(uint32_t now) {
             _watchdogFired = false;
             LOGI(TAG, "App connected (%s)",
                  _client.remoteIP().toString().c_str());
-            // Tell the app what it is talking to.
+            // Tell the app what it is talking to, and that there is no
+            // handheld remote any more - the app shows a remote panel,
+            // and a stale "searching" would be a lie.
             sendStatus(WALLE_ST_WELCOME, (uint8_t)commands.robotState());
+            sendStatus(WALLE_ST_REMOTE_STATE, WALLE_REMOTE_DISCONNECTED);
+            sendStatus(WALLE_ST_SENSOR, cliffSensor.state(), cliffSensor.groundCm());
         } else if (_state != APP_LISTENING) {
             _state = APP_LISTENING;
         }
@@ -242,18 +250,20 @@ void AppLink::update(uint32_t now) {
         // A text frame: at the 8 byte header we learn how long it is.
         if (_rxLen == WALLE_PROTO_TEXT_HEADER) {
             WalleTextHeader h;
-            memcpy(&h, _buf, sizeof(h));
+            // Exactly 8 bytes - NOT sizeof(h), which used to be 10 because
+            // of the alignment padding the uint16_t length introduced.
+            memcpy(&h, _buf, WALLE_PROTO_TEXT_HEADER);
 
             if (!walle_text_valid(h, h.op)) {
-                LOGW(TAG, "bad text header (op=%u len=%u)", h.op, h.len);
+                LOGW(TAG, "bad text header (op=%u len=%u)", h.op, (unsigned)walle_text_len(h));
                 sendError(WALLE_ERR_BAD_PACKET);
                 _rxLen = 0;
                 _rxWant = WALLE_PROTO_PACKET_SIZE;
                 continue;
             }
             _textOp = h.op;
-            _textLen = h.len;
-            _rxWant = (uint16_t)(WALLE_PROTO_TEXT_HEADER + h.len);
+            _textLen = walle_text_len(h);
+            _rxWant = (uint16_t)(WALLE_PROTO_TEXT_HEADER + _textLen);
         }
 
         if (_rxLen >= _rxWant) {
@@ -267,7 +277,7 @@ void AppLink::update(uint32_t now) {
     }
 
     // ---- safety watchdog ----
-    // Same rule as the radio remote: a controller that stops talking
+    // A controller that stops talking while it is driving
     // while it is driving must not leave the wheels turning.
     if (_driving && (now - _lastRxMs) > APP_TIMEOUT_MS) {
         if (!_watchdogFired) {

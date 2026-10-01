@@ -38,14 +38,12 @@
 
 // Speaker + Gemini text-to-speech. WALL-E SPEAKS its Gemini replies out
 // loud through the amplifier and speaker (section 6 + section 9).
-// Speech-to-Text is still absent: the robot has no microphone, so you
-// talk to it with the remote ("say ..."), the serial console or the
-// companion app, and WALL-E answers in its own voice.
+// Speech-to-Text is NOT here: the robot has no microphone. The app
+// does the speech recognition and sends the words as text, so the whole
+// voice pipeline is:  mic -> app -> TCP -> robot -> Gemini -> robot's
+// speaker.
 #define WALLE_ENABLE_AUDIO_OUT  1
 #define WALLE_ENABLE_TTS        1
-
-// Wireless remote link (ESP-NOW peer: the ESP32-WROOM handheld).
-#define WALLE_ENABLE_REMOTE     1
 
 // Autonomous behaviour (idle -> joke / dance / explore on its own).
 // This is the default state at boot; the remote's
@@ -68,10 +66,9 @@
 // ------------------------------------------------------------
 //  HARDWARE PINS  (ESP32-S3)
 //  >>> FILL THESE IN FOR YOUR BOARD. <<<
-//  The S3 devkit exposes far more usable GPIO than the C3 did, and
-//  the I2S microphone + speaker pins are now free because STT/TTS
-//  were removed, so there is plenty of room for the motors, the
-//  OLED and the ESP-NOW radio.
+//  The S3 devkit exposes plenty of usable GPIO: no microphone pins are
+//  needed, because speech recognition lives in the app, so the motors,
+//  the OLED, the speaker and the cliff sensor all fit comfortably.
 //
 //  Avoid on the S3:
 //    * GPIO 26..32  - wired to the SPI flash / PSRAM on most modules
@@ -370,45 +367,29 @@ static const int8_t MOTOR_R2_IN2 = TODO_CONFIGURE_GPIO;
 #define WIFI_DHCP_TIMEOUT_MS     10000
 
 // ============================================================
-//  8. WIRELESS REMOTE LINK (ESP-NOW, ESP32-WROOM remote)
+//  8. (REMOVED - the ESP32-WROOM radio remote)
 // ============================================================
-//  Why ESP-NOW: it is ESP32-to-ESP32 at the Wi-Fi MAC layer, needs
-//  no router, no access point, no pairing and no internet, and a
-//  10-byte command packet costs about as much airtime as a BLE
-//  advertisement. Latency is ~1 ms on an open channel.
+//  There is no longer a handheld remote. The companion app is the
+//  only controller, so ESP-NOW is gone from the robot entirely: one
+//  radio, one controller, one set of rules, and no radio channel to
+//  keep in sync with a router.
 //
-//  IMPORTANT - CHANNEL: ESP-NOW and the Wi-Fi station connection
-//  share one radio. While the robot is joined to the app's
-//  network it sits on the router's channel, and the remote must
-//  therefore use the SAME channel (see remote_wroom's
-//  REMOTE_CHANNEL). If the robot is not connected to Wi-Fi it
-//  falls back to WALLE_REMOTE_FALLBACK_CHANNEL. Bumping either
-//  number to match your router is the only setup the remote needs.
-
-// 0 = follow the Wi-Fi channel the robot is associated with.
-// Any other value pins the radio to that channel, which is what
-// you want if the robot spends most of its time offline.
-#define WALLE_REMOTE_PIN_CHANNEL      0
-#define WALLE_REMOTE_FALLBACK_CHANNEL 6
-
-// Hard safety timer. If no valid packet from the remote arrives
-// within this window while the remote is driving, the robot stops.
-// Held buttons re-send every REMOTE_REPEAT_MS (WROOM side), which
-// is far below this value, so a healthy link never trips it.
-#define REMOTE_TIMEOUT_MS            400
-
-// How long the remote keeps priority over other command sources
-// after it last sent a movement command (see command_dispatch).
-#define REMOTE_CONTROL_HOLD_MS       600
-
-// Seconds between status pushes to the remote. The robot only
-// sends status on events (ack, state change, error, ping reply),
-// so this is purely the keepalive floor.
-#define REMOTE_STATUS_INTERVAL_MS   1000
-
-// Log every received packet. Leave at 0; the ack/timeout logging
-// is already enough to debug a link.
-#define REMOTE_VERBOSE_LOG            0
+//  Everything the remote used to do is now either an on-screen
+//  button or something only a phone can do:
+//
+//     buttons          ->  the app's controls
+//     hold to drive    ->  the app's joystick, re-sent every 250 ms
+//     turn around      ->  app button  (WALLE_CMD_TURN_AROUND)
+//     say something    ->  app button  (WALLE_CMD_TALK)
+//     a keyboard       ->  the app's text box (WALLE_CMD_ASK)
+//     a MICROPHONE     ->  the app's speech recognition
+//
+//  The speech recognition is the real gain, and it was not
+//  previously possible at all. The remote had no microphone, and
+//  adding one to the robot would have meant an I2S capture buffer
+//  competing with the TTS ring for RAM, plus a speech recogniser in
+//  the firmware. In the app it is a browser API; the robot only ever
+//  handles TEXT. See docs/APP_INTEGRATION.md section 5.
 
 // ============================================================
 //  9. NETWORK SERVICES
@@ -471,6 +452,34 @@ static const int8_t MOTOR_R2_IN2 = TODO_CONFIGURE_GPIO;
 // (jokes, idle chatter, "say ..."). Turn off to keep speech to explicit
 // commands only.
 #define TTS_SPEAK_REPLIES        1
+
+// ---- Persona ----
+//
+// The APP owns the personality: it sends a compact JSON persona right
+// after connecting (see shared/walle_protocol.h), so a demo can change
+// who the robot is without reflashing.
+//
+// What is configured HERE is only the fallback used when the app has
+// not sent one yet - so a robot is never voiceless, and the firmware
+// still works if you drive it from the serial console with no phone.
+//
+// The buffer sizes are the hard limits. A payload field longer than
+// its buffer is REFUSED (WALLE_ERR_BAD_ARG) rather than truncated: a
+// robot whose name and whose voice disagree is far harder to debug
+// than one that politely declines.
+//
+// Sizing: a text frame is 240 bytes total. The JSON scaffolding
+// ({"n":"","s":"","m":"","p":""}) costs 27, so the prompt can never
+// exceed ~193 characters. 208 leaves headroom without letting an
+// oversized prompt through.
+#define PERSONA_NAME_MAX         24
+#define PERSONA_SUFFIX_MAX       24
+#define PERSONA_MOOD_MAX         16
+#define PERSONA_PROMPT_MAX       216
+
+// The compiled-in fallback personality.
+#define PERSONA_DEFAULT_NAME     "WALL-E"
+#define PERSONA_DEFAULT_SUFFIX   "Beep."
 
 // ============================================================
 //  10. MOTION / SPEED
@@ -573,25 +582,25 @@ static const int8_t MOTOR_R2_IN2 = TODO_CONFIGURE_GPIO;
 // Never let the robot drive itself further than this without a state change.
 #define MAX_DRIVE_MS            4000
 
-// ============================================================
-//  15. APP LINK  (the phone / web app talks to the robot)
+//  15. APP LINK  (the phone talks to the robot)
 //  ============================================================
-//  The app is simply ANOTHER CONTROLLER. It speaks the EXACT same
-//  WallePacket as the ESP-NOW remote, over TCP instead of radio, and
-//  every command lands in the same command_dispatch.cpp. There is
-//  no app-specific behaviour anywhere in the firmware, so the app
-//  can never drift from the remote's rules.
+//  The app is the ONLY controller. It speaks the EXACT same
+//  WallePacket as the serial console, over TCP, and every command lands
+//  in the same command_dispatch.cpp. There is no app-specific behaviour
+//  anywhere in the firmware, so the app can never drift from the
+//  robot's rules.
 //
-//  Why TCP and not a second ESP-NOW link: a phone cannot speak
-//  ESP-NOW, and the robot is already on the Wi-Fi network the phone
-//  is on. TCP is one small server, no libraries, and it is the only
-//  transport that can carry the variable-length text frames used by
-//  ask / speak.
+//  Why TCP: a phone cannot speak a raw peer-to-peer radio protocol, and
+//  the robot is on that same Wi-Fi network anyway. A TCP server is one
+//  small object, needs no libraries, and is the only transport that can
+//  carry the variable-length text frames used by ask, speak and
+//  set_persona.
 //
-//  Find the robot at http://<robot-ip>/ is not a thing here: this is
-//  a raw TCP socket, not HTTP. See docs/APP_INTEGRATION.md for the
-//  full contract, which is also written as a prompt to hand to the
-//  CLI building the app.
+//  Find the robot at its IP, printed on the serial log at boot. This is a
+//  raw TCP socket, not HTTP - see docs/APP_INTEGRATION.md for the full
+//  contract, which is also written as a prompt to hand to the CLI building
+//  the app.
+//
 #define WALLE_ENABLE_APP_LINK   1
 #define APP_TCP_PORT            8080
 
@@ -600,7 +609,8 @@ static const int8_t MOTOR_R2_IN2 = TODO_CONFIGURE_GPIO;
 #define APP_ALLOW_REPLACE_CLIENT 1
 
 // How long a connected app may be silent before the robot stops
-// driving on its behalf. Same idea as REMOTE_TIMEOUT_MS.
+// driving on its behalf. Same idea as a remote's link timeout, which
+// the radio controller used to need.
 #define APP_TIMEOUT_MS          700
 
 // How long the remote keeps priority after the app last drove.

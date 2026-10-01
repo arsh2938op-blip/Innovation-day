@@ -19,9 +19,9 @@ uint32_t RobotStateMachine::minDwell(RobotState s) {
         case STATE_OBSERVING: return 300;
         case STATE_MOVING:    return 250;
         case STATE_DANCING:   return 500;
-        // A held remote button re-sends continuously, so a long dwell
+        // The app re-sends a held command continuously, so a long dwell
         // here would only add lag to the next button press.
-        case STATE_REMOTE_MANUAL: return 0;
+        case STATE_MANUAL:       return 0;
         default:              return 0;
     }
 }
@@ -32,7 +32,7 @@ const char* RobotStateMachine::nameOf(RobotState s) {
         case STATE_IDLE:      return "IDLE";
         case STATE_THINKING:  return "THINKING";
         case STATE_SPEAKING:  return "SPEAKING";
-        case STATE_REMOTE_MANUAL: return "REMOTE";
+        case STATE_MANUAL:       return "MANUAL";
         case STATE_EXPLORING: return "EXPLORING";
         case STATE_OBSERVING: return "OBSERVING";
         case STATE_MOVING:    return "MOVING";
@@ -81,14 +81,14 @@ void RobotStateMachine::enter(RobotState s, uint32_t now) {
     LOGI(TAG, "%s", nameOf(s));
 
     // Safety: any state that does not explicitly drive the motors
-    // must not leave them running. STATE_REMOTE_MANUAL is the one
-    // exception - remote_link.cpp owns the motors there and stops
+    // must not leave them running. STATE_MANUAL is the one
+    // exception - the dispatcher owns the motors there and stops
     // them itself on release, timeout or link loss.
     switch (s) {
         case STATE_MOVING:
         case STATE_DANCING:
         case STATE_EXPLORING:
-        case STATE_REMOTE_MANUAL:
+        case STATE_MANUAL:
             break;                       // motion is owned elsewhere
         default:
             motors.stop();
@@ -104,7 +104,7 @@ void RobotStateMachine::enter(RobotState s, uint32_t now) {
         case STATE_OBSERVING: oled.setExpression(EXPR_EXPLORING); break;
         case STATE_MOVING:    oled.setExpression(EXPR_HAPPY);     break;
         case STATE_DANCING:   oled.setExpression(EXPR_DANCING);   break;
-        case STATE_REMOTE_MANUAL: oled.setExpression(EXPR_HAPPY); break;
+        case STATE_MANUAL:       oled.setExpression(EXPR_HAPPY); break;
         case STATE_OFFLINE:   oled.setExpression(EXPR_OFFLINE);   break;
         default: break;
     }

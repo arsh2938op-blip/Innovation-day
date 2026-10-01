@@ -1,37 +1,44 @@
 # WALL-E Robot — ESP32-S3 🤖
 
 The **main WALL-E brain**. A small mobile AI toy robot built around an
-**ESP32-S3**: four motors, an OLED face, a state machine, autonomous
-behaviour, dance, Gemini text AI, the companion-app link, and a
-wireless link to a handheld remote.
+**ESP32-S3**: four motors through a motor driver module, an OLED face, a
+state machine, autonomous behaviour, dance, Gemini text AI, spoken replies
+through Gemini TTS, an HC-SR04 that stops it at the edge of a table, and a
+link to the companion app.
 
-> **TTS is back - WALL-E speaks.** Gemini replies are turned into speech
-> with the **Gemini TTS API** and played through the I2S amplifier.
-> Speech-to-Text is still absent: the robot has no microphone, so you
-> talk to it from the remote, the serial console or the app. See §7-§8.
->
-> **Gemini, not Groq:** Groq has no text-to-speech endpoint at all (it is
-> a text/LLM + Whisper-STT platform), so "Gemini or Groq" resolves to
-> **Gemini**. Its TTS models return `audio/L16;codec=pcm;rate=24000` -
-> raw signed 16-bit PCM, **no MP3, no WAV header** - so the ESP32 needs
-> no audio decoder. It reuses the chat API key, so there is **no new
-> secret to configure**.
+> **The app is the only controller.** The ESP32-WROOM handheld remote has been
+> removed, so ESP-NOW is gone: one radio, one controller, one set of rules.
+> See §7.
+
+> **Speech recognition lives in the app.** The robot has **no microphone** and
+> does no STT — a deliberate division of labour, explained in §7. The phone
+> does the listening and sends the words as text; the robot does the thinking,
+> the speaking and the driving.
+
+> **Gemini, not Groq:** Groq has no text-to-speech endpoint at all (it is a
+> text/LLM + Whisper-STT platform), so "Gemini or Groq" resolves to
+> **Gemini**. Its TTS models return `audio/L16;codec=pcm;rate=24000` — raw
+> signed 16-bit PCM, **no MP3, no WAV header** — so the ESP32 needs no audio
+> decoder. It reuses the chat API key, so there is **no new secret**.
 
 ```
-ESP32-WROOM remote ──ESP-NOW──▶ ESP32-S3 (this firmware) ──▶ motors / OLED
-                                                             │
-  companion app ──WebSocket──▶ ESP32-S3 ◀──Gemini API────────┘ (text only)
+companion app ──TCP:8080──▶ ESP32-S3 (this firmware) ──▶ motors / OLED
+  (speech in,                   │        ▲
+   persona, drive,              │        └── HC-SR04, tilted down at 45°
+   dance, ask)                   ├──Gemini chat──▶ the brain
+                                 └──Gemini TTS───▶ I²S ──▶ amp ──▶ speaker
+serial console ──UART──▶ (same dispatcher)
 ```
 
 The ESP32-S3 is the **physical brain** and the only thing that drives the
-motors. Every controller — the remote, the serial console, and later the app
-— funnels through one dispatcher (`src/command_dispatch.cpp`).
+motors. The app and the serial console both funnel through one dispatcher
+(`src/command_dispatch.cpp`), which is the only place a command means
+anything.
 
-The remote is a **separate firmware** in `../remote_wroom/`, built for a plain
-ESP32-WROOM. See [`../remote_wroom/README.md`](../remote_wroom/README.md).
+**Who decides what the robot is:** the app. It sends a *persona* right after
+connecting, so the personality can change without reflashing. See §7B.
 
 ---
-
 ## 1. Hardware list
 
 | # | Part | Notes |
@@ -41,13 +48,11 @@ ESP32-WROOM. See [`../remote_wroom/README.md`](../remote_wroom/README.md).
 | 3 | **4× DC motors** | TT gear motors with wheels |
 | 4 | **Motor driver module** | **4 independent channels** — 2× TB6612FNG is the reference design (§4b) |
 | 5 | **HC-SR04 ultrasonic** | the table-edge sensor, mounted tilted **down at 45°** (§4c) |
-| 6 | **I²S amplifier + 8 Ω speaker** | e.g. MAX98357A — WALL-E's voice (§7A) |
-| 7 | **ESP32-WROOM board** | the handheld remote — see `../remote_wroom/` |
-| 8 | **Buttons** | on the remote only |
-| 9 | **Camera** | ⚠️ depends on the exact board — see §11 |
-| 10 | **Power** | LiPo + appropriate regulator, plus a **separate 5 V rail for the motors** |
-| 11 | **Wiring** | Jumper wires, common ground, breadboard / perfboard |
-| 12 | **2× 1 k / 2 k resistors** | the HC-SR04 ECHO voltage divider (§4c) — not optional |
+| 6 | **I²S amplifier + 8 Ω speaker** | e.g. MAX98357A — WALL-E's voice (§7C) |
+| 7 | **Camera** | ⚠️ depends on the exact board — see §11 |
+| 8 | **Power** | LiPo + appropriate regulator, plus a **separate 5 V rail for the motors** |
+| 9 | **Wiring** | Jumper wires, common ground, breadboard / perfboard |
+| 10 | **2x 1 k / 2 k resistors** | the HC-SR04 ECHO voltage divider (§4c) — not optional |
 
 > ⚠️ **Motor power**: never power TT motors from the ESP32 3V3 pin. Use a
 > separate battery/regulator and tie the grounds together. Add a 100 µF
@@ -59,7 +64,7 @@ ESP32-WROOM. See [`../remote_wroom/README.md`](../remote_wroom/README.md).
 
 The **amplifier and speaker** are **not yet wired**: see §2 for the
 `SPK_I2S_*` placeholders. There is still **no microphone** — Speech-to-Text
-stays on the remote or the app.
+stays in the app.
 
 ---
 
@@ -92,8 +97,6 @@ Open `include/config.h` and replace each `TODO_CONFIGURE_GPIO`:
 | **5. Camera** | all `CAMERA_*_PIN` (only if you enable the camera) |
 | **6. Speaker** | `SPK_I2S_BCLK_PIN`, `SPK_I2S_LRCK_PIN`, `SPK_I2S_DOUT_PIN`, `SPK_ENABLE_PIN` |
 
-The remote's buttons have their own placeholder list in
-`../remote_wroom/include/config.h` (`TODO_CONFIGURE_REMOTE_GPIO`).
 
 Motor index order used everywhere in the code:
 
@@ -138,48 +141,48 @@ just swap its two direction pins in `config.h`.
 
 ```
 WALL-E/
-├── shared/
-│   └── walle_protocol.h   # ★ the command/status vocabulary, used by BOTH
-│                          #   firmwares. Constants only, no code.
-├── robot_s3/              # ← THIS firmware
-│   ├── platformio.ini     # build config + the walle_s3_test env
+├── robot_s3/                      ← THIS firmware. The only project.
+│   ├── platformio.ini
 │   ├── include/
-│   │   ├── config.h       # ★ ALL hardware/API/timing config lives here
-│   │   ├── log.h          # [TAG] message macros
-│   │   └── secrets.example.h  # copy to secrets.h, never commit
+│   │   ├── config.h               # ★ EVERY pin, timing, host and threshold
+│   │   ├── log.h                  # [TAG] message macros
+│   │   └── secrets.example.h      # copy to secrets.h and fill in
 │   ├── src/
-│   │   ├── main.cpp                 # tiny: setup + loop
-│   │   ├── command_dispatch.*       # ★ the single command interface + priority
-│   │   ├── safety.*                 # ★ the ONE authority on "may the wheels move?"
-│   │   ├── cliff_sensor.*           # HC-SR04, tilted down at 45° — table-edge stop
-│   │   ├── obstacle_detector.h      # the sensor interface (no behaviour code)
-│   │   ├── maneuver.*               # timed motions: N steps, turn around, retreat
-│   │   ├── remote_link.*            # ESP-NOW transport + safety watchdog
-│   │   ├── app_link.*               # companion app over TCP, same packets
-│   │   ├── wifi_manager.*           # connect / reconnect / offline mode
-│   │   ├── motor_controller.*       # 4 motors via a driver module, ramping, e-stop
-│   │   ├── oled_display.*           # face + expression system
-│   │   ├── gemini_client.*          # text → text
-│   │   ├── tts_client.*             # text → streamed PCM (Gemini TTS)
-│   │   ├── audio_output.*           # I²S ring-buffer speaker, loads only when speaking
-│   │   ├── camera_manager.*         # camera (stub — see §11)
-│   │   ├── robot_state.*            # the state machine
-│   │   ├── behavior.*               # autonomy + Gemini logic
-│   │   ├── dance.*                  # the dance routine
-│   │   └── hardware_test.*          # test menu + serial console
+│   │   ├── main.cpp               # tiny: setup + loop
+│   │   ├── command_dispatch.*     # ★ the single command interface + priority
+│   │   ├── safety.*               # ★ the ONE authority on "may the wheels move?"
+│   │   ├── cliff_sensor.*         # HC-SR04, tilted down at 45° — table-edge stop
+│   │   ├── obstacle_detector.h    # the sensor interface (no behaviour code)
+│   │   ├── maneuver.*             # timed motions: N steps, turn around, retreat
+│   │   ├── app_link.*             # the companion app over TCP — the only controller
+│   │   ├── wifi_manager.*         # connect / reconnect / offline mode
+│   │   ├── motor_controller.*     # 4 motors via a driver module, ramp, e-stop
+│   │   ├── oled_display.*         # face + expression system
+│   │   ├── gemini_client.*        # text → text (persona-aware)
+│   │   ├── tts_client.*           # text → streamed PCM (Gemini TTS)
+│   │   ├── audio_output.*         # I²S ring-buffer speaker, loads only when speaking
+│   │   ├── persona.*              # who the robot is — the app decides
+│   │   ├── camera_manager.*       # camera (stub — see §11)
+│   │   ├── robot_state.*          # the state machine
+│   │   ├── behavior.*             # autonomy + Gemini logic
+│   │   ├── dance.*                # the dance routine
+│   │   └── hardware_test.*        # test menu + serial console
 │   ├── docs/
-│   │   └── APP_INTEGRATION.md       # ★ the app contract (also a prompt for a CLI)
-│   │   └── hardware_test.*          # test menu + serial console
-│   └── README.md
-└── remote_wroom/          # ← the separate handheld remote
-    ├── platformio.ini
-    ├── include/config.h
-    ├── src/{main,remote_input,remote_link}.*
-    └── README.md
+│   │   └── APP_INTEGRATION.md     # ★ the app contract (+ a prompt for a CLI)
+│   └── README.md                  ← this file
+└── shared/
+    └── walle_protocol.h           # the wire format. Constants only, no code
 ```
 
----
+There is no second project any more. `shared/walle_protocol.h` is included
+by `robot_s3` through `-I` in `platformio.ini`, and it is the single source
+of truth for the app's wire format.
 
+`command_dispatch.*`, `safety.*` and `app_link.*` are the three files worth
+reading first: they are the whole of "what can make the robot move, and who
+is allowed to make it move".
+
+---
 ## 4. Required libraries
 
 Deliberately minimal, all via PlatformIO (`platformio.ini`):
@@ -189,7 +192,6 @@ Deliberately minimal, all via PlatformIO (`platformio.ini`):
 | `Adafruit SSD1306` + `Adafruit GFX Library` | the OLED face |
 | `ArduinoJson` | parsing Gemini JSON |
 | `HTTPClient` (built into the ESP32 Arduino core) | HTTPS requests |
-| `esp_now.h` (built in) | the wireless remote link |
 
 The `lib_deps` list is **unchanged by adding TTS**: everything audio needs
 (`driver/i2s.h`, `esp_http_client.h`, mbedTLS base64) is part of the
@@ -348,7 +350,7 @@ the robot.
 5. When the floor appears again, back away `SAFETY_BACKAWAY_STEPS`
    steps and carry on.
 
-If a remote or the app owns the wheels at the moment of the drop, the
+If the app owns the wheels at the moment of the drop, the
 guard does **not** auto-recover — the human is in charge.
 
 ---
@@ -369,9 +371,6 @@ exact dev board (e.g. `esp32-s3-devkitc-1`, `adafruit_feather_esp32s3`).
 
 First build downloads the ESP32 toolchain (~250 MB) and can take 10+ minutes.
 
-The remote is built separately from its own folder — see
-`../remote_wroom/README.md`. The two projects never share source, so a
-mistake in one can never be compiled into the other.
 
 ---
 
@@ -418,167 +417,162 @@ model and speech.
 
 ---
 
-## 7. The wireless remote (ESP-NOW)
+## 7. The companion app — the only controller
 
-The ESP32-WROOM handheld sends commands to the S3 over **ESP-NOW**.
+> **The ESP32-WROOM handheld remote has been removed.** ESP-NOW is gone
+> from the robot entirely: one radio, one controller, one set of rules, and
+> no radio channel to keep in sync with a router. `include/config.h`
+> section 8 explains what replaced what.
 
-### 7.1 Why ESP-NOW
+### The app is not a special case
 
-ESP-NOW is ESP32-to-ESP32 traffic at the Wi-Fi MAC layer. For a local
-point-to-point remote it is the right tool:
+There is **no app-specific code anywhere in the firmware.** `AppLink` moves
+the `WallePacket` over TCP, and hands every frame to the same
+`command_dispatch.cpp` the serial console uses. The app can never drift from
+the robot's rules because there is only one set of rules.
 
-* **No router, no access point, no internet, no pairing.** Both boards just
-  need the same channel.
-* **Low latency.** A 10-byte command frame is roughly one management-frame
-  slot; measured in the low single-digit milliseconds on a clear channel.
-* **Tiny overhead.** No connection, no GATT, no profile — the whole protocol
-  is a 10-byte struct, which is why it beats BLE here on complexity.
-* **No extra library.** `esp_now.h` ships inside the ESP-IDF core, so the
-  remote firmware has **no `lib_deps` at all** and builds in seconds.
-* It is the classic ESP32-to-ESP32 link and the one the vendor's own examples
-  target.
+```
+companion app ──TCP:8080──┐
+                          ├──▶ command_dispatch.cpp ──▶ safety guard ──▶ motors
+serial console ──UART─────┘
+```
 
-**The one trade-off to know about:** ESP-NOW shares the Wi-Fi radio *and
-channel* with the robot's station connection. While WALL-E is joined to your
-router it sits on the router's channel, and the remote must be on that same
-channel. With the default `WALLE_REMOTE_PIN_CHANNEL = 0` the robot simply
-follows the router and prints the channel it chose at boot, so you set the
-remote to match. If the robot is offline it falls back to
-`WALLE_REMOTE_FALLBACK_CHANNEL` (6).
+`CommandDispatcher::notify()` fans every ack, error and state change out on
+every request, so the console and the app are structurally incapable of
+disagreeing.
 
-> BLE would use a genuinely separate radio and therefore be immune to the
-> channel question — at the cost of a connection model, a GATT profile and a
-> far larger firmware. If you later find yourself fighting channel conflicts
-> in a busy 2.4 GHz environment, that is the moment to switch. The command
-> protocol in `../shared/walle_protocol.h` is transport-agnostic, so only the
-> two `remote_link.*` files would change.
+### How the app opens the socket
 
-### 7.2 Configuration (robot side, `config.h` §8)
+A browser cannot open a raw TCP socket. The app is a Capacitor app with a
+small native plugin that does exactly that and nothing else:
 
-| Define | Meaning |
-|--------|---------|
-| `WALLE_REMOTE_PIN_CHANNEL` | `0` = follow the router's channel |
-| `WALLE_REMOTE_FALLBACK_CHANNEL` | channel to use when offline (6) |
-| `REMOTE_TIMEOUT_MS` | **safety stop if nothing is heard for this long** (400 ms) |
-| `REMOTE_CONTROL_HOLD_MS` | how long a remote command keeps priority (600 ms) |
-| `REMOTE_STATUS_INTERVAL_MS` | floor on the reverse status direction (1000 ms) |
+```
+React UI  →  WallETcpPlugin (Java)  →  TCP socket  →  robot
+```
 
-### 7.3 Command protocol
+The plugin only moves bytes. All framing, the watchdog and reconnect logic
+live in TypeScript, because that is the only place there is one copy.
 
-One fixed 10-byte little-endian packet, defined once in
-[`../shared/walle_protocol.h`](../shared/walle_protocol.h):
+### Speech recognition lives in the app
 
-| Byte | Field | Meaning |
-|------|-------|---------|
-| 0 | `magic` | `0xA5` — sanity check |
-| 1 | `version` | `0x01` — protocol revision |
-| 2 | `type` | `0x01` command, `0x02` status |
-| 3 | `cmd` | command id or status id |
-| 4 | `value` | small argument (state, error code) |
-| 5 | `seq` | rolling counter |
-| 6 | `flags` | bit 0 = button still held |
-| 7 | `reserved` | `0` |
-| 8–9 | `arg` | `uint16` LE (e.g. millivolts) |
+**The robot has no microphone and does no speech recognition.** This is a
+deliberate division of labour, and it is the one thing that could not have
+been done on the firmware:
 
-Commands: `move_forward`, `move_backward`, `turn_left`, `turn_right`,
-`rotate_left`, `rotate_right`, `stop`, `dance`, `explore`, `idle`,
-`autonomous_on`, `autonomous_off`, `expression_happy`,
-`expression_thinking`, `expression_surprised`, `expression_confused`,
-`expression_idle`, plus `hello`, `ping`, `bye` for the link itself.
+| | In the app | In the firmware |
+|---|---|---|
+| Speech recognition | ✔ browser API, on a phone's real CPU | ✘ an I²S capture buffer competing with the TTS ring for RAM, plus a recogniser |
+| Microphone permission | the OS prompt the user understands | — |
+| Language selection | a picker | — |
+| AI + TTS | ✘ needs the Gemini key on the phone | ✔ key stays in one place |
 
-Status back to the remote: `WELCOME`, `ACK` (echoes the command that ran),
-`ERROR` (with a reason), `ROBOT_STATE`, `REMOTE_STATE`, `BATTY` (unused —
-no sensor), `PONG`.
+The whole voice pipeline is therefore:
 
-The robot **never sends a status stream**. It answers a command, a state
-change, or a ping. A 10-byte ack per command is the entire return traffic.
+```
+ phone mic → app speech recognition → TEXT over TCP → robot
+            → Gemini → TTS → I²S → amplifier → robot's own speaker
+```
 
-### 7.4 Discovery
+The robot only ever handles text. It answers in text *and* speaks, and the
+answer comes back as a `TEXT` frame for the app's transcript.
 
-No MAC addresses to configure. The remote broadcasts `HELLO`; the robot
-replies unicast to whoever sent it and remembers that MAC; from then on the
-remote sends straight to the robot. A re-flashed remote is picked up
-automatically because the robot deletes the stale peer and learns the new one.
+### The 700 ms watchdog
 
-### 7.5 Low latency and the safety timeout
+While the app is **driving**, it must send something at least every 700 ms
+(`APP_TIMEOUT_MS`) or the robot stops and releases the wheels. A phone whose
+screen locks must never leave the robot driving. The app re-sends a held
+command every 250 ms, and `PING`s every 300 ms when idle but connected.
 
-A held button sends its command on the **press edge** and then re-sends every
-`REMOTE_HOLD_REPEAT_MS` (50 ms) while it is held. Releasing every direction
-button sends `stop`.
+### Full contract
 
-That refresh is what makes the timeout safe rather than twitchy:
+**[`docs/APP_INTEGRATION.md`](docs/APP_INTEGRATION.md)** — byte layouts, the
+complete command/status/error/cliff tables, the persona, a session
+walkthrough, a TypeScript reference client, a Web Speech API example, a
+Python smoke test, and **a ready-to-paste prompt for the CLI that will modify
+the app.**
 
-* the repeat (50 ms) is far below `REMOTE_TIMEOUT_MS` (400 ms), so a healthy
-  link never trips the watchdog;
-* a packet lost to interference costs 50 ms of motion, not a full stop;
-* if the remote genuinely disappears — battery flat, out of range, crashed —
-  the robot stops within `REMOTE_TIMEOUT_MS` using `emergencyStop()`.
+### The text frame had a real bug — do not reintroduce it
 
-Two further guards exist, so a single lost packet can never leave the wheels
-turning:
+`WalleTextHeader` used to hold `uint16_t len`. A `uint16_t` has 2-byte
+alignment, so the compiler inserted a padding byte, the length landed at
+**offset 6** instead of **5**, and the struct was **10 bytes** instead of 8.
+The app reads the length from offset 5 and expects an 8-byte header, so
+**every `ask`, `speak` and `set_persona` frame was silently misparsed** and
+the stream resynchronised to nothing.
 
-1. `remoteLink::update()` — the link-level watchdog (above).
-2. `CommandDispatcher::tick()` — a backstop that stops the wheels if a motion
-   command goes stale without a `stop`.
-
-The timeout watchdog lives in the link, **not** the dispatcher, precisely so
-that "the remote vanished" is a condition the transport can always answer.
-
-### 7.6 Connection state
-
-`RemoteLinkState` is one of `REMOTE_DISCONNECTED`, `REMOTE_CONNECTING`,
-`REMOTE_CONNECTED`, `REMOTE_TIMEOUT`. Transitions are logged
-(`[S3] Remote CONNECTED`, `[S3] Remote TIMEOUT`) and pushed to the remote
-once, on the transition. The OLED shows `remote ok` / `remote lost` /
-`no remote` — but **only when the state changes**, so it cannot flicker or
-fight the behaviour layer for the status line.
-
-`status` on the serial console prints the current link state, whether the
-remote holds control, and whether autonomy is on.
-
-### 7.7 Command priority
-
-Resolved once, in `command_dispatch.cpp`:
-
-| Priority | Rule |
-|----------|------|
-| **P0** | `stop` / `bye` from **any** source always runs. It cancels dance, a Gemini call, exploration and remote driving at once. It can never be refused or queued. |
-| **P1** | While the remote holds control, movement commands from **other** sources are **refused** and logged. Exactly one source can own the wheels — there is never a contest. |
-| **P2** | Otherwise the most recent movement command wins, and WALL-E goes back to driving itself afterwards. |
-| **P3** | Mode and expression commands are accepted from any source, except that anything which would *move* the robot is ignored while the remote holds control. |
-
-Two deliberate details:
-
-* A refused command still returns an `ERROR` status, so the remote can tell
-  the user *why* nothing happened.
-* Only a **remote** stop resumes autonomous behaviour. A stop from the app or
-  the console parks the robot, so it cannot drive off by itself immediately
-  after somebody hit the emergency stop.
-
-### 7.9 Voice over the remote: `TALK` and `JOKE`
-
-Two voice commands were added to `shared/walle_protocol.h` so the handheld can
-make WALL-E speak without any PC in the loop:
-
-| Command | What the robot does |
-|---------|--------------------|
-| `WALLE_CMD_TALK` (`0x15`) | asks Gemini for a line, then speaks it |
-| `WALLE_CMD_JOKE` (`0x16`) | asks Gemini for a joke, then speaks it |
-
-They are plain fixed-size commands, so **no new wire format and no
-variable-length frame** was introduced — the 10-byte packet is unchanged and
-`sizeof(WallePacket) == WALLE_PROTO_PACKET_SIZE` still holds.
-
-Both go through the normal dispatcher, so they are refused with a reported
-error (`NOT_CONFIGURED` when the speaker pins or API key are missing, `BUSY`
-while the remote holds the wheels) rather than silently doing nothing.
-
-The **remote never carries the Gemini key and never handles audio** — it only
-names an action. The robot asks, speaks, and stays the only brain.
+The header is now built from individual bytes (`lenLo`, `lenHi`) with
+`static_assert`s on `sizeof` and on `offsetof`, so it cannot come back.
+Treat those asserts as load-bearing.
 
 ---
 
-## 7A. Text-to-Speech (Gemini)
+## 7B. The persona — the app decides who the robot is
+
+**The app owns the robot's personality.** On every connect it sends
+`SET_PERSONA` (`0x1d`) followed by a `TEXT` frame (op `0x04`) carrying
+compact JSON:
+
+```
+app                                              robot
+ |-- COMMAND set_persona (0x1d) ----------------->|
+ |-- TEXT   op=0x04  {"n":"Vulkan",...} --------->|  parses
+ |<-- ACK   cmd = 0x1d ----------------------------|  or ERROR / BAD_ARG
+```
+
+```json
+{"n":"Vulkan","s":"Friend!","m":"happy","p":"You are Vulkan, ..."}
+```
+
+| Key | Buffer | Required | What it does |
+|---|---|---|---|
+| `n` | 24 | **yes** | the robot's name |
+| `s` | 24 | no (`""` ok) | appended to every reply before it is spoken |
+| `m` | 16 | no (`""` ok) | mood, informational |
+| `p` | 216 | **yes** | replaces the Gemini **system instruction** |
+
+### Why the app owns it
+
+A demo build should be able to change who the robot is **without
+reflashing anything**, and the persona has to arrive before the first
+question. Neither is possible if it is compiled in. The firmware keeps a
+compiled-in default (`PERSONA_DEFAULT_NAME`, `GEMINI_SYSTEM_PROMPT`) so a
+robot driven from the serial console is never voiceless.
+
+### The suffix is added by the firmware, not trusted to the model
+
+The prompt tells Gemini to end every reply with the suffix, and it usually
+does. But the robot must not *depend* on that to sound like itself, so
+`Persona::decorate()` appends it if — and only if — it is not already
+there, case-insensitively and ignoring trailing whitespace.
+
+### All or nothing
+
+A missing key, or a field longer than its buffer, is refused with
+`WALLE_ERR_BAD_ARG` and the **previous persona is left completely
+untouched**. Partially applying one would give a robot whose name and whose
+voice disagree, which is impossible to debug from the outside.
+
+`set_persona` is the **only** command acknowledged *after* its text frame,
+because the fixed packet carries no payload: acking it on arrival would
+report success before anyone had parsed anything.
+
+### The budget is genuinely tight
+
+A text frame is **240 bytes total**. The scaffolding
+`{"n":"","s":"","m":"","p":""}` costs 27, so the longest prompt the protocol
+can physically carry is `240 − 27 − 1 = 212` bytes. The app's current prompt
+is 156, leaving 51 bytes of slack. That is why the keys are single letters —
+spelling them out costs about 20 bytes, which at this size is the difference
+between a usable prompt and no persona at all.
+
+### Test it without the phone
+
+Hardware-test option **11** sends the exact frames the app sends, then
+proves the refusals: a missing key, garbage, and an oversized field — each
+followed by a check that the name is *still* `Pinocchio`.
+
+From the serial console: `whoami`, and `persona <json>`.
+## 7C. Text-to-Speech (Gemini)
 
 ### The pipeline
 
@@ -678,74 +672,20 @@ refused with `BUSY` until `conversationFinished()` releases it.
 This is not decoration: a robot that rolls around while it is talking
 cannot be heard and cannot be stopped by the person listening to it.
 
-### 7.8 App and remote coexistence
+### 7.8 The app and the serial console
 
 Both are clients of the S3; the S3 stays the brain and the only motor driver.
 
 ```
 app    ──WebSocket──▶ ┐
                      ├──▶ command_dispatch ──▶ motors / OLED / behaviour
-remote ──ESP-NOW───▶ ┘
+console --UART-----> |
 ```
 
 They can be used at the same time. Whichever source last issued a *movement*
 command holds the wheels until it stops or times out, and §7.7 makes that
-rule explicit rather than emergent. The remote never replaces the S3 and never
-touches the app protocol: the firmware's Robot API v1 surface is unchanged,
-so the existing companion app keeps working exactly as before.
-
----
-
-## 7B. The companion app (TCP)
-
-### The app is just another remote
-
-There is **no app-specific code anywhere in the firmware.** `AppLink`
-moves the *same* `WallePacket` as the radio remote, over TCP instead of
-ESP-NOW, and hands every frame to the same `command_dispatch.cpp`. That is
-the whole design: the app cannot drift from the remote's rules, because
-there is only one set of rules.
-
-```
-phone / browser app ──TCP:8080──┐
-                                ├──▶ command_dispatch.cpp ──▶ safety guard ──▶ motors
-ESP32-WROOM remote ──ESP-NOW────┘
-serial console ────UART─────────┘
-```
-
-`CommandDispatcher::notify()` fans every ack, error and state change out to
-**both** links at once, so the two are structurally incapable of
-desynchronising.
-
-### Why TCP and not a second radio link
-
-A phone cannot speak ESP-NOW, and the robot is already on the Wi-Fi network
-the phone is on. A `WiFiServer` is one small object, needs no libraries, and
-— unlike ESP-NOW — can carry the variable-length text frames that `ask` and
-`speak` need.
-
-### Stream framing
-
-TCP has no message boundaries: one read can return half a packet or three
-packets. So bytes are buffered and only acted on when a whole frame is
-present — 10 bytes for a fixed packet, 8 + `len` for a text frame. Every
-frame must start with the magic byte `0xA5`, and anything else is skipped,
-which gives free resynchronisation if the app reconnects mid-frame.
-
-### The watchdog
-
-While the app is driving it must send something every `APP_TIMEOUT_MS`
-(700 ms) or the robot stops and releases control. A phone whose screen
-locks must never leave the robot driving. The app should re-send the
-movement command every ~250 ms with `WALLE_FLAG_HELD` set, exactly as the
-radio remote does.
-
-### Full contract
-
-**[`docs/APP_INTEGRATION.md`](docs/APP_INTEGRATION.md)** — byte layouts, the
-full command/status/error/cliff tables, a session walkthrough, a TypeScript
-reference client, a Python smoke test, and **a ready-to-paste prompt for
-the CLI that will build the app side.**
+rule explicit rather than emergent. Neither ever replaces the S3, and
+neither has a private path to the motors.
 
 ---
 
@@ -766,7 +706,7 @@ which is what an app, a controller or an avoidance routine needs.
 | `startForward(ms)` etc. | — | — |
 
 One step is `STEP_DISTANCE_CM` (10 cm). Every command goes through the
-dispatcher, so the cliff guard gets to veto it exactly as it would a remote
+dispatcher, so the cliff guard gets to veto it exactly as it would an app
 command — and a cliff detected half way through "move 8 steps" **truncates
 the maneuver** rather than being ignored until it finishes.
 
@@ -863,15 +803,15 @@ All pins and speeds come from `config.h`. Speeds are 0–255
   │
   ├► THINKING ─────────────────────────────► IDLE
   ├► DANCING ─────────────────────────────────► IDLE
-  ├► REMOTE_MANUAL ──(remote owns the wheels)──► IDLE
+  ├► STATE_MANUAL  ──(the app owns the wheels)──► IDLE
   └► OFFLINE (no Wi-Fi) ─────────────────────► IDLE
 ```
 
 Each state has a **minimum dwell time** so it cannot flicker, and
 `RobotStateMachine::enter()` **stops the motors for every state that does not
 explicitly drive them**. That is the main runaway-motor guard.
-`REMOTE_MANUAL` is the one state the guard deliberately skips, because
-`remote_link.cpp` owns the wheels there and stops them itself on release,
+`STATE_MANUAL` is the one state the guard deliberately skips, because the
+command dispatcher owns the wheels there and stops them itself on release,
 timeout or link loss.
 
 ### 9.3 Autonomous behaviour (`behavior.*`)
@@ -880,7 +820,7 @@ timeout or link loss.
 
 * **IDLE** — after a random 45–120 s gap, WALL-E picks something to do: tell a
   joke, dance, or start exploring. Only when autonomy is **on**
-  (`WALLE_AUTONOMOUS_DEFAULT`, toggled at runtime by the remote's
+  (`WALLE_AUTONOMOUS_DEFAULT`, toggled at runtime by the app's
   `autonomous_on` / `autonomous_off`).
 * **EXPLORING** — random sequence of *move forward / turn left / turn right /
   stop and observe*, each for a random 0.7–1.8 s. Timings in `config.h`
@@ -888,9 +828,9 @@ timeout or link loss.
 * **THINKING** — the Gemini conversation script (§7): one bounded HTTP request
   per step, so the loop keeps running.
 
-A remote movement command calls `behavior.suspendAutonomy()`, which parks
+A movement command from the app calls `behavior.suspendAutonomy()`, which parks
 exploration and dance and pushes the next self-initiated action out of the way
-so WALL-E does not wander the instant the remote lets go.
+so WALL-E does not wander the instant the app lets go.
 
 No planning happens on the ESP32 — the firmware only *decides when*; Gemini
 decides *what to say*.
@@ -952,7 +892,7 @@ The firmware boots into a serial menu:
  1) OLED expressions        8) Gemini
  2) Motor 1                 9) Speaker tone (440 Hz)
  3) Motor 2                10) TTS (speak a Gemini line)
- 4) Motor 3                11) Wireless remote
+ 4) Motor 3                11) Persona (accept + refuse)
  5) Motor 4                12) App link (TCP)
  6) Camera                 13) Driver module (STBY + channels)
  7) Wi-Fi                  14) Cliff sensor (HC-SR04)
@@ -965,15 +905,16 @@ Useful details:
 * **Motors** are always stopped between tests, and each motor is driven
   `+120 → −120 → stop` so you can see it run forwards and backwards and fix the
   direction pins.
-* **Wireless remote** listens for 15 s and prints the link state — the fastest
-  way to confirm the two boards see each other.
+* **App link** prints the robot's IP and the `nc` command to try it from a laptop.
+* **App link** prints the robot's IP and the `nc` command to try it from a laptop.
 * **App link** prints the robot's IP and the `nc` command to try it from a laptop.
 * Missing hardware prints an explicit reason instead of failing silently.
 * Motors are driven to `STOP` between every test, and nothing in the menu except
   tests 2–5 and 15 can make a wheel turn.
 
 There is no microphone test: the robot has no microphone. Speech-to-Text runs
-on the radio remote or the app instead (§7B).
+in the app, then sends the words to the robot (section 7).
+in the app, then sends the words to the robot (section 7).
 
 ### Serial console (normal build)
 
@@ -996,7 +937,9 @@ Open the monitor at 115200 baud and type:
 | `watch` | continuous cliff readings + the safety verdict + free heap |
 | `status` | everything: state, driver, sensor, links, safety, audio |
 
-**The console goes through the same dispatcher as the wireless remote and the
+**The console goes through the same dispatcher as the app**, so the two can never
+**The console goes through the same dispatcher as the app**, so the two can never
+disagree about priority.
 app**, so all three can never disagree about priority. That is why `fwd` and
 `move_forward` behave identically.
 
@@ -1032,27 +975,26 @@ Until then, WALL-E explores using **movement and timing only**.
 
 ## 12. Robustness
 
-The firmware is built for a physical robot that can crash, drop Wi-Fi, lose a
-remote and return garbage from an API.
+The firmware is built for a physical robot that can crash, drop Wi-Fi, lose the app and return nonsense from an API. These are the guarantees that follow from that:
 
 | Situation | What happens |
 |-----------|--------------|
 | Boot | Motors driven to `STOP` **before** anything else is initialised |
-| Wi-Fi missing / wrong password | `OFFLINE` state, `X X` face, movement + OLED + dance + remote still work, reconnects every 10 s |
+| Wi-Fi missing / wrong password | `OFFLINE` state, `X X` face, motors + OLED + dance still work, reconnects every 10 s |
 | No SSID in `secrets.h` | Starts offline, logs a warning, never crashes |
-| Remote not powered on | `REMOTE_CONNECTING`; the robot drives itself as normal |
-| **Remote vanishes mid-drive** | `emergencyStop()` within `REMOTE_TIMEOUT_MS`, state → `REMOTE_TIMEOUT`, OLED shows `remote lost` |
-| Remote battery flat / out of range | Same as above — the repeat timer is the only thing keeping the wheels turning |
-| Remote sends an unknown command | Logged, `ERROR` returned, robot unaffected |
-| Remote and app both command movement | Remote holds the wheels; the app's movement command is refused and logged (P1) |
-| Remote sends `stop` | Everything halts and autonomy resumes |
+| App not started | `LISTENING`; the robot drives itself as normal |
+| **App vanishes mid-drive** | `emergencyStop()` within `APP_TIMEOUT_MS`, control released, app told `LINK_TIMEOUT` |
+| App screen locks / app backgrounded | Same as above - the 250 ms re-send and the wake lock are the only things keeping the wheels turning |
+| App sends an unknown command | Logged, `ERROR` returned, robot unaffected |
+| App sends a malformed persona | `BAD_ARG`, and the previous persona is left completely untouched |
+| App sends `stop` | Everything halts and autonomy resumes |
 | Gemini fails or times out | `EXPR_CONFUSED` + `gemini?` label, back to `IDLE` |
 | Gemini blocked / returns empty | Logged with the block reason, no retry loop |
 | Motor pins still `TODO_CONFIGURE_GPIO` | Every motion command is refused with `NOT_CONFIGURED`; nothing drives a wrong pin |
 | Camera missing | Continues with non-camera behaviour |
 | **Cliff sensor sees a drop** | `emergencyStop()` (no ramp), maneuver + dance cancelled, wheels blocked, backs away and cools down |
 | **Cliff sensor stops reporting** | Treated as `fault`, not "safe" — same immediate stop |
-| Cliff sensor pins unset | Sensor disabled at boot; wall logged that safety is unavailable; the rest of the robot works |
+| Cliff sensor pins unset | Sensor disabled at boot; serial log records that safety is unavailable; the rest of the robot works |
 | Any motion command while blocked | Refused with `WALLE_ERR_CLIFF` / `SENSOR_FAULT` / `BUSY`, never silently ignored |
 | A maneuver interrupted by a cliff | Truncated at once — it does not run to its deadline |
 | Any motion while WALL-E is thinking/speaking | Refused with `BUSY`; the wheels are locked for the whole conversation |
@@ -1062,8 +1004,9 @@ remote and return garbage from an API.
 | Audio idle for 1.5 s | I²S driver and ring buffer released, amplifier unpowered |
 | TTS fails or times out | `EXPR_ERROR` + `tts?`, **carries on silently** — a speech failure is never a robot failure |
 | No Gemini key | `tts.ready()` is false, `TALK`/`JOKE` refused with `NOT_CONFIGURED` |
-| Remote presses TALK while it holds the wheels | Refused with `BUSY` — the remote always has priority |
-| Remote drops out mid-drive | `REMOTE_TIMEOUT_MS` watchdog stops the wheels unconditionally |
+| App presses TALK while it holds the wheels | Refused with `BUSY` - the app always has priority |
+| App presses TALK while it holds the wheels | Refused with `BUSY` - the app always has priority |
+| **App drops out mid-drive** | `APP_TIMEOUT_MS` watchdog stops the wheels and releases control, then reports `LINK_TIMEOUT` |
 | App drops out mid-drive | `APP_TIMEOUT_MS` watchdog stops the wheels and releases control |
 | App sends a frame with a bad length | `BAD_PACKET`, and the stream resynchronises on the next `0xA5` |
 | Any critical error | `motors.emergencyStop()` and `speaker.stop()` |
@@ -1085,7 +1028,8 @@ only ever entered by code that also stops the robot again.
   audible gap) because the speaker runs at real time while data arrives.
 * **No speech-to-text** — by design. There is no microphone on the robot, so
   there is no wake word and no voice input. WALL-E is *spoken to* from the
-  remote, the serial console or the app; it only *speaks* itself.
+  the app or the serial console; it only *speaks* itself.
+  the app or the serial console; it only *speaks* itself.
 * **The speaker is not wired yet** — `SPK_I2S_*` are still
   `TODO_CONFIGURE_GPIO`, so TTS is inert until you set them (§2).
 * **No obstacle detection** — the cliff sensor sees the floor, not walls. WALL-E
@@ -1116,8 +1060,7 @@ only ever entered by code that also stops the robot again.
 * **Wheels only** — no balance/inversion recovery like the film WALL-E.
 * **Battery monitoring is not implemented** — the `WALL-E_ST_BATTERY` status
   message exists in the protocol but no sensor feeds it, so it is never sent.
-* **The remote's button pins are not chosen yet** — see
-  `../remote_wroom/README.md`.
+
 
 ---
 
@@ -1134,7 +1077,8 @@ only ever entered by code that also stops the robot again.
 - [ ] Set `MOTOR_ENABLE2_PIN` if you use two driver boards (§4b)
 - [ ] Create `include/secrets.h` from the template (§6)
 - [ ] Verify motor directions with hardware test 2–5
-- [ ] Set the remote's button pins and confirm the channel matches (§7)
+- [ ] Set the robot's IP in the app's Connect tab and confirm it connects (section 7)
+- [ ] Set the app's robot IP in the app's Connect tab and confirm it connects (section 7)
 - [ ] Measure the actual Wi-Fi signal / confirm the 5 V motor rail
 
 ### Nice to have
@@ -1161,8 +1105,8 @@ pio run -e walle_s3_test -t upload               # 3. run test 14 FIRST (the sen
 pio run -t upload                                 # 4. build the robot
 pio device monitor                                # 5. type: help
 
-# 6. flash the remote (separate project, separate folder)
-cd ../remote_wroom && pio run -t upload
+# 6. the app needs no firmware change: it already speaks this protocol
+# 6. the app needs no firmware change: it already speaks this protocol
 ```
 
 If WALL-E refuses to move at all, the first thing to check is

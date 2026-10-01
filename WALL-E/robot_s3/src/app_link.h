@@ -2,15 +2,15 @@
 //  App link - the phone / web app as a second controller
 //  ------------------------------------------------------------
 //  The app is NOT a special case. It speaks the EXACT same
-//  WallePacket as the ESP-NOW remote, over TCP instead of radio, and
+//  WallePacket as the serial console, over TCP, and
 //  every command lands in the same command_dispatch.cpp. There is no
 //  app-specific behaviour anywhere in the firmware, which is exactly
 //  why the app can never drift from the remote's rules.
 //
 //  WHY TCP
-//  A phone cannot speak ESP-NOW, and the robot is already on the same
-//  Wi-Fi network the phone is on. A TCP server is one small object,
-//  needs no libraries, and - unlike ESP-NOW - can carry the
+//  A phone cannot speak a raw peer-to-peer radio protocol, and the robot is
+//  already on the same Wi-Fi network the phone is on. A TCP server is one
+//  small object, needs no libraries, and is the only transport that can
 //  variable-length text frames that ask/speak need.
 //
 //  HOW STREAM FRAMING WORKS HERE

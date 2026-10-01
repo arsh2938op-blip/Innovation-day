@@ -2,21 +2,20 @@
 //  Command dispatcher - the robot's single command interface
 //  ------------------------------------------------------------
 //  Every controller funnels its commands through dispatch():
-//    * the ESP32-WROOM wireless remote  (ESP-NOW, SOURCE_REMOTE)
-//    * the companion app                (TCP,     SOURCE_APP)
-//    * the serial console               (UART,    SOURCE_SERIAL)
-//    * the firmware itself              (          SOURCE_INTERNAL)
+//    * the companion app  (TCP,  SOURCE_APP)   ← the only one
+//    * the serial console (UART, SOURCE_SERIAL)
+//    * the firmware itself          (         SOURCE_INTERNAL)
 //
 //  There is exactly ONE implementation of each command, so adding a
 //  new controller never means adding a new version of a robot
-//  command. That is the whole reason the app can be built without
-//  touching the firmware: it is just another caller of this class.
+//  command. That is the whole reason the app needed no firmware work
+//  to be trusted: it is just another caller of this class.
 //
 //  PRIORITY RULES
 //  -------------
 //    P0  STOP / BYE / IDLE from ANY source always runs. It cannot be
 //        refused, queued or overridden. It cancels dance, a Gemini
-//        call, exploration, a maneuver and remote driving at once.
+//        call, exploration, a maneuver and driving at once.
 //    P1  While a controller owns the wheels, movement commands from
 //        other sources are REFUSED with an error. Exactly one source
 //        can ever own the wheels - there is never a contest.
@@ -41,9 +40,8 @@
 
 enum CommandSource : uint8_t {
     SOURCE_NONE = 0,
-    SOURCE_REMOTE,
-    SOURCE_SERIAL,
     SOURCE_APP,
+    SOURCE_SERIAL,
     SOURCE_INTERNAL,
 };
 
@@ -60,10 +58,20 @@ public:
     // command somehow went stale without a STOP or a link timeout.
     void tick(uint32_t now);
 
-    // Called by a link when that controller goes away. Always stops
-    // the wheels and releases the control lock.
-    void onRemoteLost();
+    // Called by the app link when the app goes away. Always stops the
+    // wheels and releases the control lock.
     void onAppLost();
+
+    // ---- the persona ----
+    // Called by the app link with the text frame that followed
+    // WALLE_CMD_SET_PERSONA. This is the ONLY place that ACKs that
+    // command, because the command itself carries no payload: the
+    // acknowledgement has to wait until the words have been parsed.
+    //
+    // Sends ACK on success, WALLE_ERR_BAD_ARG if the payload is
+    // malformed. The previous persona is left completely untouched
+    // when it fails.
+    void setPersona(const char* json);
 
     // For logs and for the status frames the robot sends back.
     static const char* sourceName(CommandSource s);
@@ -71,8 +79,7 @@ public:
     // Current RobotState as a plain byte, for the status protocol.
     uint8_t robotState() const;
 
-    // Who owns the wheels right now.
-    bool remoteHasControl() const { return _owner == SOURCE_REMOTE; }
+    // True while the app owns the wheels.
     bool appHasControl() const { return _owner == SOURCE_APP; }
     bool hasController() const { return _owner != SOURCE_NONE; }
     CommandSource owner() const { return _owner; }
@@ -95,7 +102,7 @@ private:
     void releaseControl();
 
     CommandSource _owner = SOURCE_NONE;
-    uint32_t _lastRemoteMotionMs = 0;  // for the stale-motion backstop
+    uint32_t _lastMotionMs = 0;  // for the stale-motion backstop
 
     // True while a controller's timed maneuver is running. Used to hand
     // the wheels back the moment it finishes, so a controller that asked
